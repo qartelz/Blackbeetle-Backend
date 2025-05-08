@@ -1,0 +1,85 @@
+# Python bytecode files
+*.pyc
+__pycache__/
+
+# Database files
+db.sqlite3
+
+# Environment variables
+.env
+
+# Virtual environment directory
+venv/
+env/
+.venv/
+.virtualenv/
+
+# VSCode directory and workspace settings
+.vscode/
+
+# Django migrations
+*/migrations/*
+
+# Celery-related files
+celerybeat-schedule
+*.pid
+*.log
+
+# Static files and media uploads
+/staticfiles/
+media/
+
+# Local settings
+local_settings.py
+
+# IDE and editor files
+.idea/
+*.swp
+*.swo
+*.swn
+
+# Django caches
+*.log
+
+# Django test database files
+*.db
+
+# Distribution and packaging files
+*.tar.gz
+*.zip
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+
+# Coverage reports
+.coverage
+*.cover
+*.hypothesis/
+
+# Sphinx documentation
+docs/_build/
+
+# Pytest
+.cache
+
+# Docker-related files (if using Docker)
+docker-compose.override.yml
+*.docker
+
+# Celery logs and related files
+celery.log
+celeryd.pid
+
+# PyCharm
+.idea/
+
+# VSCode settings (optional)
+.vscode/
+
+# Jupyter Notebook checkpoints (if using Jupyter)
+.ipynb_checkpoints
+
+# Caches from various tools
+*.sqlite3-journal
