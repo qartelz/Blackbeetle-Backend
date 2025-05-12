@@ -2,6 +2,11 @@ from django.db import models
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 import uuid
+from django.contrib.auth import get_user_model
+from django.utils import timezone
+from apps.trades.models import Trade
+
+User = get_user_model()
 
 class Notification(models.Model):
     NOTIFICATION_TYPES = (
@@ -134,4 +139,120 @@ class Notification(models.Model):
 
 #     def __str__(self):
 #         return f"{self.get_notification_type_display()} for {self.recipient}: {self.title}"
+
+class NotificationPreference(models.Model):
+    user = models.OneToOneField(
+        User,
+        on_delete=models.CASCADE,
+        related_name='notification_preferences'
+    )
+    enable_trade_updates = models.BooleanField(default=True)
+    enable_realtime_updates = models.BooleanField(default=True)
+    enable_email_notifications = models.BooleanField(default=True)
+    enable_push_notifications = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Notification preferences for {self.user.email}"
+
+class TradeNotification(models.Model):
+    class NotificationType(models.TextChoices):
+        TRADE_UPDATE = 'TRADE_UPDATE', 'Trade Update'
+        TRADE_COMPLETED = 'TRADE_COMPLETED', 'Trade Completed'
+        TRADE_CANCELLED = 'TRADE_CANCELLED', 'Trade Cancelled'
+        WARZONE_UPDATE = 'WARZONE_UPDATE', 'Warzone Update'
+
+    class Priority(models.TextChoices):
+        LOW = 'LOW', 'Low'
+        NORMAL = 'NORMAL', 'Normal'
+        HIGH = 'HIGH', 'High'
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='trade_notifications'
+    )
+    trade = models.ForeignKey(
+        Trade,
+        on_delete=models.CASCADE,
+        related_name='notifications'
+    )
+    notification_type = models.CharField(
+        max_length=20,
+        choices=NotificationType.choices
+    )
+    priority = models.CharField(
+        max_length=10,
+        choices=Priority.choices,
+        default=Priority.NORMAL
+    )
+    message = models.TextField()
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', 'is_read', 'created_at']),
+            models.Index(fields=['trade', 'notification_type']),
+        ]
+
+    def __str__(self):
+        return f"{self.notification_type} notification for {self.user.email}"
+
+    @classmethod
+    def create_trade_notification(cls, user, trade, notification_type, message, priority=Priority.NORMAL):
+        """
+        Create a new trade notification and handle delivery based on user preferences.
+        """
+        if not hasattr(user, 'notification_preferences'):
+            return None
+
+        prefs = user.notification_preferences
+        if not prefs.enable_trade_updates:
+            return None
+
+        notification = cls.objects.create(
+            user=user,
+            trade=trade,
+            notification_type=notification_type,
+            message=message,
+            priority=priority
+        )
+
+        # Handle real-time updates
+        if prefs.enable_realtime_updates:
+            from channels.layers import get_channel_layer
+            from asgiref.sync import async_to_sync
+
+            channel_layer = get_channel_layer()
+            async_to_sync(channel_layer.group_send)(
+                f"trade_updates_{user.id}",
+                {
+                    "type": "notification",
+                    "data": {
+                        "id": notification.id,
+                        "type": notification.notification_type,
+                        "message": notification.message,
+                        "priority": notification.priority,
+                        "created_at": notification.created_at.isoformat(),
+                        "trade_id": trade.id
+                    }
+                }
+            )
+
+        # Handle email notifications
+        if prefs.enable_email_notifications:
+            from django.core.mail import send_mail
+            send_mail(
+                subject=f"Trade Update: {trade.company.trading_symbol}",
+                message=message,
+                from_email=None,  # Use default from email
+                recipient_list=[user.email],
+                fail_silently=True
+            )
+
+        return notification
 

@@ -685,8 +685,6 @@ class AvailableB2BPlansView(generics.ListAPIView):
 this is new free trail for the user provided by the admin created by sidharth before testing
 """
 
-
-
 class GrantFreeTrialView(APIView):
     permission_classes = [IsAdminUser]
 
@@ -697,11 +695,12 @@ class GrantFreeTrialView(APIView):
             return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
 
         # Check if user already got a trial
-        if user.subscriptions.filter(plan__is_trial=True).exists():
-            return Response({"error": "User has already received a free trial"}, status=status.HTTP_400_BAD_REQUEST)
+        # if user.subscriptions.filter(plan__is_trial=True).exists():
+        #     return Response({"error": "User has already received a free trial"}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            trial_plan = Plan.objects.get(is_trial=True)  # Make sure your Plan model has `is_trial` boolean field
+            # trial_plan = Plan.objects.get(is_trial=True)  # Make sure your Plan model has `is_trial` boolean field
+            trial_plan = Plan.objects.get(name='FREE_TRIAL')
         except Plan.DoesNotExist:
             return Response({"error": "Free Trial plan not found"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 

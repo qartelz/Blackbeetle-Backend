@@ -273,6 +273,76 @@ class Trade(models.Model):
         self.warzone_history = current_history
         self.save()
 
+    @classmethod
+    def get_trades_for_subscription(cls, user, subscription):
+        """
+        Get trades based on subscription level and user's subscription date.
+        Returns appropriate number of previous and new trades.
+        """
+        if not subscription or not subscription.is_active:
+            return cls.objects.none()
+
+        subscription_date = subscription.start_date
+        now = timezone.now()
+
+        # Get all active trades
+        active_trades = cls.objects.filter(
+            status=cls.Status.ACTIVE
+        ).order_by('-created_at')
+
+        # Get completed trades after subscription
+        completed_trades = cls.objects.filter(
+            status=cls.Status.COMPLETED,
+            completed_at__gte=subscription_date
+        ).order_by('-created_at')
+
+        # Get previous trades (before subscription) for basic users
+        previous_trades = cls.objects.filter(
+            created_at__lt=subscription_date,
+            status__in=[cls.Status.COMPLETED, cls.Status.CANCELLED]
+        ).order_by('-created_at')[:6] if subscription.plan.name == 'BASIC' else cls.objects.none()
+
+        # Combine and sort all relevant trades
+        all_trades = (active_trades | completed_trades | previous_trades).distinct().order_by('-created_at')
+
+        # Filter based on subscription plan
+        if subscription.plan.name == 'BASIC':
+            return all_trades[:12]  # 6 previous + 6 new trades
+        elif subscription.plan.name == 'PREMIUM':
+            return all_trades[:15]  # 6 previous + 9 new trades
+        else:  # SUPER_PREMIUM or FREE_TRIAL
+            return all_trades  # All trades
+
+    @property
+    def is_accessible_to_user(self, user):
+        """
+        Check if a trade is accessible to a user based on their subscription.
+        """
+        if not user.is_authenticated:
+            return False
+
+        subscription = user.get_active_subscription()
+        if not subscription:
+            return False
+
+        # Free trial users get same access as SUPER_PREMIUM
+        if subscription.plan.name == 'FREE_TRIAL':
+            return True
+
+        # Check if trade was created after user's subscription
+        if self.created_at < subscription.start_date:
+            return False
+
+        # Check plan type access
+        if subscription.plan.name == 'BASIC':
+            return self.plan_type in ['BASIC', 'PREMIUM', 'SUPER_PREMIUM']
+        elif subscription.plan.name == 'PREMIUM':
+            return self.plan_type in ['PREMIUM', 'SUPER_PREMIUM']
+        elif subscription.plan.name == 'SUPER_PREMIUM':
+            return self.plan_type == 'SUPER_PREMIUM'
+
+        return False
+
 class TradeHistory(models.Model):
     trade = models.ForeignKey(
         Trade,

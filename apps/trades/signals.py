@@ -76,20 +76,32 @@ class TradeSignalHandler:
     def _get_subscriber_groups_cached(plan_levels: tuple, timestamp: int) -> List[str]:
         """Fetch cached group names for subscribers with access to the given plan levels."""
         now = timezone.now()
+        trade_time = timezone.datetime.fromtimestamp(timestamp, tz=timezone.utc)
+
         subscriptions = Subscription.objects.filter(
             plan__name__in=plan_levels,
             is_active=True,
             start_date__lte=now,
-            end_date__gte=now
-        ).values_list('user__id', flat=True)
-        return [f"trade_updates_{user_id}" for user_id in subscriptions]
+            end_date__gte=now,
+            start_date__lte=trade_time
+        ).select_related('user').prefetch_related('user__notification_preferences')
+
+        # Filter users based on notification preferences
+        valid_subscriptions = []
+        for sub in subscriptions:
+            user = sub.user
+            if hasattr(user, 'notification_preferences'):
+                prefs = user.notification_preferences
+                if prefs.enable_trade_updates and prefs.enable_realtime_updates:
+                    valid_subscriptions.append(sub)
+
+        return [f"trade_updates_{sub.user.id}" for sub in valid_subscriptions]
 
     @staticmethod
-    async def _get_subscriber_groups(plan_levels: List[str]) -> List[str]:
+    async def _get_subscriber_groups(plan_levels: List[str], trade_time) -> List[str]:
         """Get subscriber groups with 5-minute caching, async-compatible."""
-        # Wrap sync ORM/cache call in sync_to_async
         return await sync_to_async(TradeSignalHandler._get_subscriber_groups_cached)(
-            tuple(plan_levels), int(timezone.now().timestamp() // 300)
+            tuple(plan_levels), int(trade_time.timestamp())
         )
 
     @staticmethod
@@ -119,15 +131,24 @@ class TradeSignalHandler:
             if not plan_config.levels:
                 return
 
-            channel_layer = get_channel_layer()
-            group_names = await TradeSignalHandler._get_subscriber_groups(plan_config.levels)
+            trade_time = instance.created_at if hasattr(instance, 'created_at') else timezone.now()
+            group_names = await TradeSignalHandler._get_subscriber_groups(plan_config.levels, trade_time)
+            
             if not group_names:
                 return
 
-            message = {"type": "trade_update", "data": trade_data}
+            channel_layer = get_channel_layer()
+            message = {
+                "type": "trade_update",
+                "data": {
+                    **trade_data,
+                    "notification_type": "trade_update",
+                    "priority": "high" if instance.status == Trade.Status.ACTIVE else "normal"
+                }
+            }
 
             # Send to groups in chunks
-            chunk_size = 50  # Optimized chunk size
+            chunk_size = 50
             for i in range(0, len(group_names), chunk_size):
                 chunk = group_names[i:i + chunk_size]
                 tasks = [channel_layer.group_send(group, message) for group in chunk]
@@ -135,6 +156,7 @@ class TradeSignalHandler:
 
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"Sent {update_type} update to {len(group_names)} subscribers")
+
         except Exception as e:
             logger.error(f"Failed to send {update_type} update: {str(e)}")
 
