@@ -285,33 +285,54 @@ class Trade(models.Model):
         subscription_date = subscription.start_date
         now = timezone.now()
 
-        # Get all active trades
+        # Get active trades
         active_trades = cls.objects.filter(
-            status=cls.Status.ACTIVE
+            status=cls.Status.ACTIVE,
+            plan_type__in=cls._get_allowed_plan_types(subscription.plan.name)
         ).order_by('-created_at')
 
         # Get completed trades after subscription
         completed_trades = cls.objects.filter(
             status=cls.Status.COMPLETED,
-            completed_at__gte=subscription_date
+            completed_at__gte=subscription_date,
+            plan_type__in=cls._get_allowed_plan_types(subscription.plan.name)
         ).order_by('-created_at')
 
-        # Get previous trades (before subscription) for basic users
+        # Get previous trades (before subscription)
         previous_trades = cls.objects.filter(
             created_at__lt=subscription_date,
-            status__in=[cls.Status.COMPLETED, cls.Status.CANCELLED]
-        ).order_by('-created_at')[:6] if subscription.plan.name == 'BASIC' else cls.objects.none()
+            status__in=[cls.Status.COMPLETED, cls.Status.CANCELLED],
+            plan_type__in=cls._get_allowed_plan_types(subscription.plan.name)
+        ).order_by('-created_at')
 
-        # Combine and sort all relevant trades
-        all_trades = (active_trades | completed_trades | previous_trades).distinct().order_by('-created_at')
+        # Combine all trades
+        all_trades = (active_trades | completed_trades | previous_trades).distinct()
 
-        # Filter based on subscription plan
+        # Apply subscription-based limits
         if subscription.plan.name == 'BASIC':
-            return all_trades[:12]  # 6 previous + 6 new trades
+            # Get 6 previous trades
+            previous = previous_trades[:6]
+            # Get 6 newest trades (active or completed after subscription)
+            newest = (active_trades | completed_trades).distinct().order_by('-created_at')[:6]
+            return (previous | newest).distinct().order_by('-created_at')
         elif subscription.plan.name == 'PREMIUM':
-            return all_trades[:15]  # 6 previous + 9 new trades
+            # Get 6 previous trades
+            previous = previous_trades[:6]
+            # Get 9 newest trades
+            newest = (active_trades | completed_trades).distinct().order_by('-created_at')[:9]
+            return (previous | newest).distinct().order_by('-created_at')
         else:  # SUPER_PREMIUM or FREE_TRIAL
-            return all_trades  # All trades
+            return all_trades.order_by('-created_at')
+
+    @staticmethod
+    def _get_allowed_plan_types(subscription_plan):
+        """Get allowed plan types based on subscription level."""
+        if subscription_plan == 'BASIC':
+            return [Trade.PlanType.BASIC]
+        elif subscription_plan == 'PREMIUM':
+            return [Trade.PlanType.BASIC, Trade.PlanType.PREMIUM]
+        else:  # SUPER_PREMIUM or FREE_TRIAL
+            return [Trade.PlanType.BASIC, Trade.PlanType.PREMIUM, Trade.PlanType.SUPER_PREMIUM]
 
     @property
     def is_accessible_to_user(self, user):

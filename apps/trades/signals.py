@@ -83,7 +83,7 @@ class TradeSignalHandler:
             is_active=True,
             start_date__lte=now,
             end_date__gte=now,
-            start_date__lte=trade_time
+            # start_date__lte=trade_time
         ).select_related('user').prefetch_related('user__notification_preferences')
 
         # Filter users based on notification preferences
