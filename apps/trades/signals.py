@@ -1,12 +1,10 @@
 from django.db.models.signals import post_save
 from django.dispatch import receiver
-from django.core.cache import cache
 from django.utils import timezone
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
 import logging
-from typing import Dict, List, Optional
-from datetime import timedelta
+from typing import Dict, List
 
 from .models import Trade, TradeNotification
 from apps.subscriptions.models import Subscription
@@ -22,33 +20,14 @@ class PlanConfig:
         'SUPER_PREMIUM': ['BASIC', 'PREMIUM', 'SUPER_PREMIUM']
     }
     
-    TRADE_LIMITS = {
-        'BASIC': 6,
-        'PREMIUM': 15,
-        'SUPER_PREMIUM': float('inf')
-    }
-    
     @classmethod
     def get_accessible_plans(cls, plan_type: str) -> List[str]:
         """Get list of accessible plan types for a given plan."""
         return cls.PLAN_LEVELS.get(plan_type, [])
-    
-    @classmethod
-    def get_trade_limit(cls, plan_type: str) -> int:
-        """Get trade limit for a given plan type."""
-        return cls.TRADE_LIMITS.get(plan_type, 0)
 
 
 class TradeUpdateManager:
-    """Manages trade updates and caching."""
-    
-    CACHE_TIMEOUT = 3600  # 1 hour
-    CACHE_PREFIX = "trade_updates_"
-    
-    @classmethod
-    def get_cache_key(cls, user_id: int, plan_type: str) -> str:
-        """Generate cache key for user's trade updates."""
-        return f"{cls.CACHE_PREFIX}{user_id}_{plan_type}"
+    """Manages trade updates and broadcasting."""
     
     @classmethod
     def prepare_trade_data(cls, trade: Trade, action: str = "updated") -> Dict:
@@ -145,15 +124,11 @@ def handle_trade_update(sender, instance, created, **kwargs):
     try:
         action = "created" if created else "updated"
         
-        # First broadcast the update
+        # Broadcast the update
         TradeSignalHandler.broadcast_trade_update(instance, action)
         
-        # Then create notifications
+        # Create notifications
         TradeSignalHandler.create_trade_notification(instance, action)
-        
-        # Finally clear relevant caches
-        cache_key = TradeUpdateManager.get_cache_key(instance.user.id, instance.plan_type)
-        cache.delete(cache_key)
         
         logger.info(f"Successfully handled trade update for trade {instance.id}")
         
