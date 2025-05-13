@@ -267,18 +267,23 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                     # Apply subscription-based limits
                     if plan_name == 'BASIC':
                         # Get 6 previous trades
-                        previous = previous_trades[:6]
+                        previous = list(previous_trades[:6])
                         # Get exactly 6 newest trades
-                        newest = new_trades[:6]
-                        result = (previous | newest).distinct().order_by('-created_at')
+                        newest = list(new_trades[:6])
+                        # Combine both lists
+                        result = previous + newest
+                        logger.info(f"BASIC user {self.user.id}: {len(previous)} previous trades, {len(newest)} new trades")
                     elif plan_name == 'PREMIUM':
                         # Get 6 previous trades
-                        previous = previous_trades[:6]
+                        previous = list(previous_trades[:6])
                         # Get exactly 9 newest trades
-                        newest = new_trades[:9]
-                        result = (previous | newest).distinct().order_by('-created_at')
+                        newest = list(new_trades[:9])
+                        # Combine both lists
+                        result = previous + newest
+                        logger.info(f"PREMIUM user {self.user.id}: {len(previous)} previous trades, {len(newest)} new trades")
                     else:  # SUPER_PREMIUM or FREE_TRIAL
-                        result = (new_trades | previous_trades).distinct().order_by('-created_at')
+                        result = list(new_trades) + list(previous_trades)
+                        logger.info(f"{plan_name} user {self.user.id}: all trades")
 
                     def format_trade(trade):
                         if not trade:
