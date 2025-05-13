@@ -233,45 +233,52 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 logger.warning("No subscription or plan found")
                 return {'stock_data': [], 'index_data': []}
 
-            cache_key = f"trades_data_{self.user.id}_{self.subscription.plan.name}"
-            cached_data = await self.trade_manager.get_cached_trades(cache_key)
-            if cached_data:
-                logger.debug(f"Returning cached data for key: {cache_key}")
-                self.active_trade_count = len(cached_data['stock_data'])
-                return cached_data
-
-            allowed_levels = TradeUpdateManager.get_plan_levels(self.subscription.plan.name)
-            lookback_date = self.subscription.start_date - timedelta(days=30)
-
             @db_sync_to_async
             def fetch_data():
                 with transaction.atomic():
                     from .models import Company, Trade
                     from apps.indexAndCommodity.models import IndexAndCommodity
 
-                    # Get companies with active trades
-                    companies = Company.objects.filter(
-                        trades__status="ACTIVE",
-                        trades__created_at__date__gte=lookback_date,
-                        trades__created_at__date__lte=self.subscription.end_date,
-                        trades__plan_type__in=allowed_levels
-                    ).prefetch_related(
-                        'trades',
-                        'trades__analysis',
-                        'trades__history'
-                    ).distinct()[:self.stock_limit or None]
+                    subscription_date = self.subscription.start_date
+                    now = timezone.now()
+                    plan_name = self.subscription.plan.name
 
-                    # Get indices with active trades
-                    indices = IndexAndCommodity.objects.filter(
-                        trades__status="ACTIVE",
-                        trades__created_at__date__gte=lookback_date,
-                        trades__created_at__date__lte=self.subscription.end_date,
-                        trades__plan_type__in=allowed_levels
+                    # Base query for all trades
+                    base_query = Trade.objects.filter(
+                        created_at__lte=now
+                    ).select_related(
+                        'company',
+                        'analysis'
                     ).prefetch_related(
-                        'trades',
-                        'trades__analysis',
-                        'trades__history'
-                    ).distinct()
+                        'history'
+                    )
+
+                    # Get new trades (created after subscription)
+                    new_trades = base_query.filter(
+                        created_at__gte=subscription_date
+                    ).order_by('-created_at')
+
+                    # Get previous trades (before subscription)
+                    previous_trades = base_query.filter(
+                        created_at__lt=subscription_date,
+                        status__in=[Trade.Status.COMPLETED, Trade.Status.CANCELLED]
+                    ).order_by('-created_at')
+
+                    # Apply subscription-based limits
+                    if plan_name == 'BASIC':
+                        # Get 6 previous trades
+                        previous = previous_trades[:6]
+                        # Get exactly 6 newest trades (based on creation date only)
+                        newest = new_trades[:6]
+                        result = (previous | newest).distinct().order_by('-created_at')
+                    elif plan_name == 'PREMIUM':
+                        # Get 6 previous trades
+                        previous = previous_trades[:6]
+                        # Get exactly 9 newest trades (based on creation date only)
+                        newest = new_trades[:9]
+                        result = (previous | newest).distinct().order_by('-created_at')
+                    else:  # SUPER_PREMIUM or FREE_TRIAL
+                        result = (new_trades | previous_trades).distinct().order_by('-created_at')
 
                     def format_trade(trade):
                         if not trade:
@@ -300,8 +307,7 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                                     "sl": str(history.sl),
                                     "timestamp": history.timestamp.isoformat()
                                 } for history in trade.history.all()
-                            ],
-                            "insight": None
+                            ]
                         }
 
                     def format_company(company):
@@ -320,19 +326,15 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                             "updated_at": company.updated_at.isoformat()
                         }
 
+                    # Get unique companies from the filtered trades
+                    company_ids = result.values_list('company_id', flat=True).distinct()
+                    companies = Company.objects.filter(id__in=company_ids)
+                    
                     company_items = [format_company(company) for company in companies]
-                    index_items = []  # Format index items similarly if needed
+                    return {'stock_data': company_items, 'index_data': []}
 
-                    return company_items, index_items
-
-            company_items, index_items = await fetch_data()
-            self.active_trade_count = len(company_items)
-            data = {'stock_data': company_items, 'index_data': index_items}
-
-            if company_items or index_items:
-                await self.trade_manager.set_cached_trades(cache_key, data)
-
-            return data
+            return await fetch_data()
+            
         except Exception as e:
             logger.error(f"Error getting filtered trades: {str(e)}")
             return {'stock_data': [], 'index_data': []}
