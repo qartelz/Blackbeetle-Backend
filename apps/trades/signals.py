@@ -5,6 +5,7 @@ from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
 import logging
 from typing import Dict, List
+from django.db import transaction
 
 from .models import Trade, TradeNotification
 from apps.subscriptions.models import Subscription
@@ -52,15 +53,38 @@ class TradeUpdateManager:
     @classmethod
     def get_subscriber_groups(cls, trade: Trade) -> List[str]:
         """Get list of channel groups to broadcast to."""
-        # Get all active subscriptions that can access this trade
-        subscriptions = Subscription.objects.filter(
-            is_active=True,
-            end_date__gt=timezone.now(),
-            plan__name__in=PlanConfig.get_accessible_plans(trade.plan_type)
-        )
-        
-        # Create group names for each user
-        return [f"trade_updates_{sub.user.id}" for sub in subscriptions]
+        try:
+            with transaction.atomic():
+                # Get all active subscriptions that can access this trade
+                subscriptions = Subscription.objects.filter(
+                    is_active=True,
+                    end_date__gt=timezone.now(),
+                    plan__name__in=PlanConfig.get_accessible_plans(trade.plan_type)
+                ).select_related('plan')
+
+                # Create group names for each user
+                groups = []
+                for sub in subscriptions:
+                    # Check if user has reached their trade limit
+                    if sub.plan.name in ['BASIC', 'PREMIUM']:
+                        # Count trades created after subscription start
+                        trade_count = Trade.objects.filter(
+                            created_at__gte=sub.start_date,
+                            created_at__lte=timezone.now()
+                        ).count()
+                        
+                        # Only add to groups if within limit
+                        if (sub.plan.name == 'BASIC' and trade_count <= 6) or \
+                           (sub.plan.name == 'PREMIUM' and trade_count <= 9):
+                            groups.append(f"trade_updates_{sub.user.id}")
+                    else:
+                        # SUPER_PREMIUM and FREE_TRIAL users get all updates
+                        groups.append(f"trade_updates_{sub.user.id}")
+
+                return groups
+        except Exception as e:
+            logger.error(f"Error getting subscriber groups: {str(e)}")
+            return []
 
 
 class TradeSignalHandler:
@@ -74,6 +98,10 @@ class TradeSignalHandler:
             trade_data = TradeUpdateManager.prepare_trade_data(trade, action)
             groups = TradeUpdateManager.get_subscriber_groups(trade)
             
+            if not groups:
+                logger.info(f"No eligible subscribers for trade {trade.id}")
+                return
+
             for group in groups:
                 async_to_sync(channel_layer.group_send)(
                     group,
@@ -92,28 +120,48 @@ class TradeSignalHandler:
     def create_trade_notification(trade: Trade, action: str = "updated"):
         """Create notifications for relevant users."""
         try:
-            # Get all active subscriptions that can access this trade
-            subscriptions = Subscription.objects.filter(
-                is_active=True,
-                end_date__gt=timezone.now(),
-                plan__name__in=PlanConfig.get_accessible_plans(trade.plan_type)
-            )
-            
-            for subscription in subscriptions:
-                try:
-                    TradeNotification.create_trade_notification(
-                        user=subscription.user,
-                        trade=trade,
-                        notification_type=TradeNotification.NotificationType.TRADE_UPDATE,
-                        message=f"Trade update for {trade.company.trading_symbol}: {action}",
-                        priority=TradeNotification.Priority.HIGH if trade.status == Trade.Status.ACTIVE else TradeNotification.Priority.NORMAL
-                    )
-                except Exception as e:
-                    logger.error(f"Error creating notification for user {subscription.user.id}: {str(e)}")
-                    continue
-            
-            logger.info(f"Created notifications for trade {trade.id} for {subscriptions.count()} users")
-            
+            with transaction.atomic():
+                # Get all active subscriptions that can access this trade
+                subscriptions = Subscription.objects.filter(
+                    is_active=True,
+                    end_date__gt=timezone.now(),
+                    plan__name__in=PlanConfig.get_accessible_plans(trade.plan_type)
+                ).select_related('plan')
+                
+                for subscription in subscriptions:
+                    try:
+                        # Check if user has reached their trade limit
+                        if subscription.plan.name in ['BASIC', 'PREMIUM']:
+                            trade_count = Trade.objects.filter(
+                                created_at__gte=subscription.start_date,
+                                created_at__lte=timezone.now()
+                            ).count()
+                            
+                            # Only create notification if within limit
+                            if (subscription.plan.name == 'BASIC' and trade_count <= 6) or \
+                               (subscription.plan.name == 'PREMIUM' and trade_count <= 9):
+                                TradeNotification.create_trade_notification(
+                                    user=subscription.user,
+                                    trade=trade,
+                                    notification_type=TradeNotification.NotificationType.TRADE_UPDATE,
+                                    message=f"Trade update for {trade.company.trading_symbol}: {action}",
+                                    priority=TradeNotification.Priority.HIGH if trade.status == Trade.Status.ACTIVE else TradeNotification.Priority.NORMAL
+                                )
+                        else:
+                            # SUPER_PREMIUM and FREE_TRIAL users get all notifications
+                            TradeNotification.create_trade_notification(
+                                user=subscription.user,
+                                trade=trade,
+                                notification_type=TradeNotification.NotificationType.TRADE_UPDATE,
+                                message=f"Trade update for {trade.company.trading_symbol}: {action}",
+                                priority=TradeNotification.Priority.HIGH if trade.status == Trade.Status.ACTIVE else TradeNotification.Priority.NORMAL
+                            )
+                    except Exception as e:
+                        logger.error(f"Error creating notification for user {subscription.user.id}: {str(e)}")
+                        continue
+                
+                logger.info(f"Created notifications for trade {trade.id}")
+                
         except Exception as e:
             logger.error(f"Error creating trade notifications: {str(e)}")
 
