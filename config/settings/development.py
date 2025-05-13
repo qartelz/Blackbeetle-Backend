@@ -33,18 +33,29 @@ from .base import *
 # }
 
 
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.postgresql',
+#         'NAME': 'railway',
+#         'USER': 'postgres',
+#         'PASSWORD': 'yEnxxNzptmKRPRsJKaUaaXXXlHiSlvdA',
+#         'HOST': 'centerbeam.proxy.rlwy.net',  
+#         'PORT': '39900',
+#         'CONN_MAX_AGE': 300,
+#     }
+# }
+
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
         'NAME': 'railway',
         'USER': 'postgres',
-        'PASSWORD': 'yEnxxNzptmKRPRsJKaUaaXXXlHiSlvdA',
-        'HOST': 'centerbeam.proxy.rlwy.net',  
-        'PORT': '39900',
+        'PASSWORD': 'nokbbbXgIDvLZYDXpOEnOpOblnuxibOu',
+        'HOST': 'maglev.proxy.rlwy.net',  
+        'PORT': '25499',
         'CONN_MAX_AGE': 300,
     }
 }
-
 """
 rajid db not to be used fo now
 """

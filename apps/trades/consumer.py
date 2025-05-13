@@ -9,6 +9,8 @@ import json
 import logging
 from datetime import datetime
 from django.utils import timezone
+from channels.layers import get_channel_layer
+from asgiref.sync import async_to_sync
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -103,46 +105,8 @@ class TradeUpdatesConsumer(AsyncJsonWebsocketConsumer):
 
             for trade in trades:
                 try:
-                    trade_data = {
-                        "id": trade.id,
-                        "company": {
-                            "id": trade.company.id,
-                            "trading_symbol": trade.company.trading_symbol,
-                            "exchange": trade.company.exchange,
-                            "instrument_type": trade.company.instrument_type
-                        },
-                        "trade_type": trade.trade_type,
-                        "status": trade.status,
-                        "plan_type": trade.plan_type,
-                        "warzone": str(trade.warzone),
-                        "image": trade.image.url if trade.image else None,
-                        "warzone_history": trade.warzone_history or [],
-                        "created_at": trade.created_at.isoformat(),
-                        "updated_at": trade.updated_at.isoformat()
-                    }
-
-                    # Add analysis data if exists
-                    if hasattr(trade, 'analysis'):
-                        trade_data["analysis"] = {
-                            "bull_scenario": trade.analysis.bull_scenario or "",
-                            "bear_scenario": trade.analysis.bear_scenario or "",
-                            "status": trade.analysis.status,
-                            "completed_at": trade.analysis.completed_at.isoformat() if trade.analysis.completed_at else None
-                        }
-
-                    # Add trade history
-                    trade_data["trade_history"] = [{
-                        "buy": str(history.buy),
-                        "target": str(history.target),
-                        "sl": str(history.sl),
-                        "timestamp": history.timestamp.isoformat(),
-                        "risk_reward_ratio": str(history.risk_reward_ratio),
-                        "potential_profit_percentage": str(history.potential_profit_percentage),
-                        "stop_loss_percentage": str(history.stop_loss_percentage)
-                    } for history in trade.history.all()]
-
+                    trade_data = await self.format_trade_data(trade)
                     formatted_trades.append(trade_data)
-
                 except Exception as e:
                     logger.error(f"Error formatting trade {trade.id}: {str(e)}")
                     continue
@@ -168,6 +132,49 @@ class TradeUpdatesConsumer(AsyncJsonWebsocketConsumer):
                 }
             })
 
+    @database_sync_to_async
+    def format_trade_data(self, trade):
+        """Format trade data for WebSocket response."""
+        trade_data = {
+            "id": trade.id,
+            "company": {
+                "id": trade.company.id,
+                "trading_symbol": trade.company.trading_symbol,
+                "exchange": trade.company.exchange,
+                "instrument_type": trade.company.instrument_type
+            },
+            "trade_type": trade.trade_type,
+            "status": trade.status,
+            "plan_type": trade.plan_type,
+            "warzone": str(trade.warzone),
+            "image": trade.image.url if trade.image else None,
+            "warzone_history": trade.warzone_history or [],
+            "created_at": trade.created_at.isoformat(),
+            "updated_at": trade.updated_at.isoformat()
+        }
+
+        # Add analysis data if exists
+        if hasattr(trade, 'analysis'):
+            trade_data["analysis"] = {
+                "bull_scenario": trade.analysis.bull_scenario or "",
+                "bear_scenario": trade.analysis.bear_scenario or "",
+                "status": trade.analysis.status,
+                "completed_at": trade.analysis.completed_at.isoformat() if trade.analysis.completed_at else None
+            }
+
+        # Add trade history
+        trade_data["trade_history"] = [{
+            "buy": str(history.buy),
+            "target": str(history.target),
+            "sl": str(history.sl),
+            "timestamp": history.timestamp.isoformat(),
+            "risk_reward_ratio": str(history.risk_reward_ratio),
+            "potential_profit_percentage": str(history.potential_profit_percentage),
+            "stop_loss_percentage": str(history.stop_loss_percentage)
+        } for history in trade.history.all()]
+
+        return trade_data
+
     async def trade_update(self, event):
         """Handle trade update messages."""
         try:
@@ -180,10 +187,14 @@ class TradeUpdatesConsumer(AsyncJsonWebsocketConsumer):
             # Create notification
             await self.create_notification(trade, data)
 
-            # Send update to client
+            # Format and send trade update
+            trade_data = await self.format_trade_data(trade)
             await self.send_json({
                 "type": "trade_update",
-                "data": data
+                "data": {
+                    **data,
+                    "trade": trade_data
+                }
             })
 
         except Exception as e:
@@ -225,4 +236,57 @@ class TradeUpdatesConsumer(AsyncJsonWebsocketConsumer):
         await self.send_json({
             "type": "notification",
             "data": event["data"]
-        }) 
+        })
+
+    @classmethod
+    async def broadcast_trade_update(cls, trade_id, action, data=None):
+        """Broadcast trade update to all eligible users."""
+        try:
+            channel_layer = get_channel_layer()
+            trade = await cls.get_trade_async(trade_id)
+            
+            if not trade:
+                logger.error(f"Trade {trade_id} not found for broadcast")
+                return
+
+            # Get all active subscriptions
+            subscriptions = await cls.get_active_subscriptions()
+            
+            for subscription in subscriptions:
+                if trade.is_accessible_to_user(subscription.user):
+                    group_name = f"trade_updates_{subscription.user.id}"
+                    await channel_layer.group_send(
+                        group_name,
+                        {
+                            "type": "trade_update",
+                            "data": {
+                                "trade_id": trade_id,
+                                "action": action,
+                                "trade_status": trade.status,
+                                **(data or {})
+                            }
+                        }
+                    )
+                    logger.info(f"Broadcast trade update to user {subscription.user.id}")
+
+        except Exception as e:
+            logger.error(f"Error broadcasting trade update: {str(e)}")
+
+    @staticmethod
+    @database_sync_to_async
+    def get_trade_async(trade_id):
+        """Get trade asynchronously."""
+        try:
+            return Trade.objects.select_related('company').get(id=trade_id)
+        except Trade.DoesNotExist:
+            return None
+
+    @staticmethod
+    @database_sync_to_async
+    def get_active_subscriptions():
+        """Get all active subscriptions."""
+        return list(Subscription.objects.select_related('user', 'plan').filter(
+            is_active=True,
+            start_date__lte=timezone.now(),
+            end_date__gte=timezone.now()
+        )) 
