@@ -18,6 +18,9 @@ from ..serializers.trade_serializers import (
 )
 from ..filters.TradeFilter import TradeFilter
 from ..pagination import TradePagination
+import logging
+
+logger = logging.getLogger(__name__)
 
 class TradeViewSet(viewsets.ModelViewSet):
     queryset = Trade.objects.all()
@@ -76,55 +79,37 @@ class TradeViewSet(viewsets.ModelViewSet):
     @transaction.atomic
     def create(self, request, *args, **kwargs):
         """Create trade with analysis"""
-
         try:
             serializer = self.get_serializer(data=request.data)
             serializer.is_valid(raise_exception=True)
-            try:
-                trade = serializer.save(user=request.user)
-                return Response(
-                    TradeSerializer(trade).data,
-                    status=status.HTTP_201_CREATED
-                )
-            except DjangoValidationError as e:
-                # Roll back the transaction
-                print('exception one ------------------------------------------------------')
-                transaction.set_rollback(True)
-                return Response(
-                    {'error': e.messages if hasattr(e, 'messages') else [str(e)]},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            except DRFValidationError as e:
-                # Roll back the transaction
-                print('exception two ------------------------------------------------------')
-                transaction.set_rollback(True)
-                return Response(
-                    {'error': e.detail if hasattr(e, 'detail') else str(e)},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            except Exception as e:
-                # Roll back the transaction for any unexpected error
-                print('exception three ------------------------------------------------------')
-                transaction.set_rollback(True)
-                return Response(
-                    {'error': f'An unexpected error occurred: {str(e)}'},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
-                )
-        except DRFValidationError as e:
-            # Handle serializer validation errors
-            print('exception four ------------------------------------------------------')
+            
+            # Create trade within the transaction
+            trade = serializer.save(user=request.user)
+            
             return Response(
-                {'error': e.detail},
+                TradeSerializer(trade).data,
+                status=status.HTTP_201_CREATED
+            )
+            
+        except DjangoValidationError as e:
+            # Django validation errors will automatically roll back the transaction
+            return Response(
+                {'error': e.messages if hasattr(e, 'messages') else [str(e)]},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except DRFValidationError as e:
+            # DRF validation errors will automatically roll back the transaction
+            return Response(
+                {'error': e.detail if hasattr(e, 'detail') else str(e)},
                 status=status.HTTP_400_BAD_REQUEST
             )
         except Exception as e:
-            # Handle any other unexpected exceptions during serializer validation
-            print('exception five ------------------------------------------------------')
+            # Any other errors will automatically roll back the transaction
+            logger.error(f"Error creating trade: {str(e)}")
             return Response(
-                {'error': f'An unexpected error occurred during validation: {str(e)}'},
+                {'error': f'An unexpected error occurred: {str(e)}'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
-       
 
     def update(self, request, *args, **kwargs):
         partial = kwargs.pop('partial', False)
