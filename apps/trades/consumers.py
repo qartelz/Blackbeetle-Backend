@@ -16,6 +16,9 @@ from django.dispatch import receiver
 
 logger = logging.getLogger(__name__)
 
+# Create a database-specific sync_to_async decorator
+db_sync_to_async = sync_to_async(thread_sensitive=True)
+
 class DecimalEncoder(json.JSONEncoder):
     """
     Custom JSON encoder to handle Decimal objects.
@@ -172,7 +175,7 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             await self.close(code=4004)
             return False
 
-    @sync_to_async
+    @db_sync_to_async
     def _get_active_subscription(self, user):
         """Fetch the user's active subscription synchronously."""
         from apps.subscriptions.models import Subscription
@@ -348,7 +351,7 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 }
             })
 
-    @database_sync_to_async
+    @db_sync_to_async
     def get_trade(self, trade_id):
         """Get trade by ID with optimized query."""
         try:
@@ -362,7 +365,7 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             logger.warning(f"Trade {trade_id} not found")
             return None
 
-    @database_sync_to_async
+    @db_sync_to_async
     def is_trade_accessible(self, trade):
         """Check if user has access to the trade."""
         try:
@@ -371,7 +374,7 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             logger.error(f"Error checking trade access: {str(e)}")
             return False
 
-    @database_sync_to_async
+    @db_sync_to_async
     def create_notification(self, trade, data):
         """Create a notification for the trade update."""
         try:

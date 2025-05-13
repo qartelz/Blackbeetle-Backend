@@ -6,7 +6,9 @@ from django.core.exceptions import ValidationError
 from decimal import Decimal
 from django.db import transaction
 from model_utils import FieldTracker
-from django.utils.log import logger
+import logging
+
+logger = logging.getLogger(__name__)
 User = get_user_model()
 
 
@@ -780,3 +782,71 @@ class FreeCallTradeHistory(models.Model):
     @property
     def stop_loss_percentage(self):
         return round(((self.buy - self.sl) / self.buy * 100), 2) if self.buy else None
+
+class TradeNotification(models.Model):
+    """Model for storing trade-related notifications."""
+    
+    class NotificationType(models.TextChoices):
+        TRADE_UPDATE = 'TRADE_UPDATE', 'Trade Update'
+        TRADE_COMPLETED = 'TRADE_COMPLETED', 'Trade Completed'
+        TRADE_CANCELLED = 'TRADE_CANCELLED', 'Trade Cancelled'
+        TRADE_ACTIVATED = 'TRADE_ACTIVATED', 'Trade Activated'
+
+    class Priority(models.TextChoices):
+        LOW = 'LOW', 'Low'
+        NORMAL = 'NORMAL', 'Normal'
+        HIGH = 'HIGH', 'High'
+        URGENT = 'URGENT', 'Urgent'
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='trades_trade_notifications'
+    )
+    trade = models.ForeignKey(
+        'Trade',
+        on_delete=models.CASCADE,
+        related_name='trades_notifications'
+    )
+    notification_type = models.CharField(
+        max_length=20,
+        choices=NotificationType.choices,
+        help_text="Type of notification"
+    )
+    message = models.TextField(
+        help_text="Notification message"
+    )
+    priority = models.CharField(
+        max_length=10,
+        choices=Priority.choices,
+        default=Priority.NORMAL,
+        help_text="Notification priority level"
+    )
+    is_read = models.BooleanField(
+        default=False,
+        help_text="Whether the notification has been read"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', 'is_read']),
+            models.Index(fields=['created_at']),
+        ]
+        app_label = 'trades'
+
+    def __str__(self):
+        return f"{self.notification_type} - {self.user.username}"
+
+    @classmethod
+    def create_trade_notification(cls, user, trade, notification_type, message, priority=Priority.NORMAL):
+        """Create a new trade notification."""
+        return cls.objects.create(
+            user=user,
+            trade=trade,
+            notification_type=notification_type,
+            message=message,
+            priority=priority
+        )
