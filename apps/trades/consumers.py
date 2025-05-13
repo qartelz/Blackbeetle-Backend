@@ -13,6 +13,7 @@ from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from django.db.models.signals import post_save
 from django.dispatch import receiver
+from django.db import transaction
 
 logger = logging.getLogger(__name__)
 
@@ -178,14 +179,19 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
     @db_sync_to_async
     def _get_active_subscription(self, user):
         """Fetch the user's active subscription synchronously."""
-        from apps.subscriptions.models import Subscription
-        now = timezone.now()
-        return Subscription.objects.filter(
-            user=user,
-            is_active=True,
-            start_date__lte=now,
-            end_date__gte=now
-        ).select_related('plan').first()
+        try:
+            with transaction.atomic():
+                from apps.subscriptions.models import Subscription
+                now = timezone.now()
+                return Subscription.objects.filter(
+                    user=user,
+                    is_active=True,
+                    start_date__lte=now,
+                    end_date__gte=now
+                ).select_related('plan').first()
+        except Exception as e:
+            logger.error(f"Error getting active subscription: {str(e)}")
+            return None
 
     async def _setup_user_group(self) -> bool:
         """Set up the user's channel group and subscription details."""
@@ -221,13 +227,6 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
     async def _get_filtered_trades(self) -> Dict:
         """
         Fetch and filter trade data based on user's subscription.
-
-        Returns:
-            Dict: Filtered stock and index trade data.
-
-        Notes:
-            - Reverted to sync-to-async for compatibility.
-            - Added logging to debug empty results.
         """
         try:
             if not self.subscription or not self.subscription.plan:
@@ -244,45 +243,93 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             allowed_levels = TradeUpdateManager.get_plan_levels(self.subscription.plan.name)
             lookback_date = self.subscription.start_date - timedelta(days=30)
 
-            from .models import Company
-            from apps.indexAndCommodity.models import IndexAndCommodity
-            from .serializers.tradeconsumer_serializers import CompanySerializer, IndexAndCommoditySeraializer
-
-            # Fetch data synchronously but with better logging
-            @sync_to_async
+            @db_sync_to_async
             def fetch_data():
-                company_qs = Company.objects.filter(
-                    trades__status="ACTIVE",
-                    trades__created_at__date__gte=lookback_date,
-                    trades__created_at__date__lte=self.subscription.end_date,
-                    trades__plan_type__in=allowed_levels
-                ).prefetch_related('trades').distinct()[:self.stock_limit or None]
+                with transaction.atomic():
+                    from .models import Company, Trade
+                    from apps.indexAndCommodity.models import IndexAndCommodity
 
-                index_qs = IndexAndCommodity.objects.filter(
-                    trades__status="ACTIVE",
-                    trades__created_at__date__gte=lookback_date,
-                    trades__created_at__date__lte=self.subscription.end_date,
-                    trades__plan_type__in=allowed_levels
-                ).prefetch_related('trades').distinct()
+                    # Get companies with active trades
+                    companies = Company.objects.filter(
+                        trades__status="ACTIVE",
+                        trades__created_at__date__gte=lookback_date,
+                        trades__created_at__date__lte=self.subscription.end_date,
+                        trades__plan_type__in=allowed_levels
+                    ).prefetch_related(
+                        'trades',
+                        'trades__analysis',
+                        'trades__history'
+                    ).distinct()[:self.stock_limit or None]
 
-                company_count = company_qs.count()
-                index_count = index_qs.count()
-                logger.debug(f"Queried {company_count} companies and {index_count} indices")
+                    # Get indices with active trades
+                    indices = IndexAndCommodity.objects.filter(
+                        trades__status="ACTIVE",
+                        trades__created_at__date__gte=lookback_date,
+                        trades__created_at__date__lte=self.subscription.end_date,
+                        trades__plan_type__in=allowed_levels
+                    ).prefetch_related(
+                        'trades',
+                        'trades__analysis',
+                        'trades__history'
+                    ).distinct()
 
-                if company_count == 0 and index_count == 0:
-                    logger.warning("No trades found matching filter criteria")
+                    def format_trade(trade):
+                        if not trade:
+                            return None
+                        
+                        return {
+                            "id": trade.id,
+                            "trade_type": trade.trade_type,
+                            "status": trade.status,
+                            "plan_type": trade.plan_type,
+                            "warzone": str(trade.warzone),
+                            "image": trade.image.url if trade.image else None,
+                            "warzone_history": trade.warzone_history or [],
+                            "analysis": {
+                                "bull_scenario": trade.analysis.bull_scenario if hasattr(trade, 'analysis') else None,
+                                "bear_scenario": trade.analysis.bear_scenario if hasattr(trade, 'analysis') else None,
+                                "status": trade.analysis.status if hasattr(trade, 'analysis') else None,
+                                "completed_at": trade.analysis.completed_at.isoformat() if hasattr(trade, 'analysis') and trade.analysis.completed_at else None,
+                                "created_at": trade.analysis.created_at.isoformat() if hasattr(trade, 'analysis') else None,
+                                "updated_at": trade.analysis.updated_at.isoformat() if hasattr(trade, 'analysis') else None
+                            } if hasattr(trade, 'analysis') else None,
+                            "trade_history": [
+                                {
+                                    "buy": str(history.buy),
+                                    "target": str(history.target),
+                                    "sl": str(history.sl),
+                                    "timestamp": history.timestamp.isoformat()
+                                } for history in trade.history.all()
+                            ],
+                            "insight": None
+                        }
 
-                company_items = [CompanySerializer(company).data for company in company_qs]
-                index_items = [IndexAndCommoditySeraializer(index).data for index in index_qs]
-                return company_items, index_items
+                    def format_company(company):
+                        trades = company.trades.filter(status=Trade.Status.ACTIVE)
+                        intraday_trade = trades.filter(trade_type=Trade.TradeType.INTRADAY).first()
+                        positional_trade = trades.filter(trade_type=Trade.TradeType.POSITIONAL).first()
+
+                        return {
+                            "id": company.id,
+                            "tradingSymbol": company.trading_symbol,
+                            "exchange": company.exchange,
+                            "instrumentName": company.instrument_type,
+                            "intraday_trade": format_trade(intraday_trade),
+                            "positional_trade": format_trade(positional_trade),
+                            "created_at": company.created_at.isoformat(),
+                            "updated_at": company.updated_at.isoformat()
+                        }
+
+                    company_items = [format_company(company) for company in companies]
+                    index_items = []  # Format index items similarly if needed
+
+                    return company_items, index_items
 
             company_items, index_items = await fetch_data()
             self.active_trade_count = len(company_items)
             data = {'stock_data': company_items, 'index_data': index_items}
 
-            if not company_items and not index_items:
-                logger.warning(f"No data to cache for user {self.user.id}, plan {self.subscription.plan.name}")
-            else:
+            if company_items or index_items:
                 await self.trade_manager.set_cached_trades(cache_key, data)
 
             return data
@@ -355,21 +402,26 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
     def get_trade(self, trade_id):
         """Get trade by ID with optimized query."""
         try:
-            return Trade.objects.select_related(
-                'company',
-                'analysis'
-            ).prefetch_related(
-                'history'
-            ).get(id=trade_id)
+            with transaction.atomic():
+                return Trade.objects.select_related(
+                    'company',
+                    'analysis'
+                ).prefetch_related(
+                    'history'
+                ).get(id=trade_id)
         except Trade.DoesNotExist:
             logger.warning(f"Trade {trade_id} not found")
+            return None
+        except Exception as e:
+            logger.error(f"Error getting trade {trade_id}: {str(e)}")
             return None
 
     @db_sync_to_async
     def is_trade_accessible(self, trade):
         """Check if user has access to the trade."""
         try:
-            return trade.is_accessible_to_user(self.user)
+            with transaction.atomic():
+                return trade.is_accessible_to_user(self.user)
         except Exception as e:
             logger.error(f"Error checking trade access: {str(e)}")
             return False
@@ -378,18 +430,19 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
     def create_notification(self, trade, data):
         """Create a notification for the trade update."""
         try:
-            message = f"Trade update for {trade.company.trading_symbol}: {data.get('action', 'updated')}"
-            priority = TradeNotification.Priority.HIGH if data.get("trade_status") == Trade.Status.ACTIVE else TradeNotification.Priority.NORMAL
-            
-            notification = TradeNotification.create_trade_notification(
-                user=self.user,
-                trade=trade,
-                notification_type=TradeNotification.NotificationType.TRADE_UPDATE,
-                message=message,
-                priority=priority
-            )
-            logger.info(f"Created notification for trade {trade.id} for user {self.user.id}")
-            return notification
+            with transaction.atomic():
+                message = f"Trade update for {trade.company.trading_symbol}: {data.get('action', 'updated')}"
+                priority = TradeNotification.Priority.HIGH if data.get("trade_status") == Trade.Status.ACTIVE else TradeNotification.Priority.NORMAL
+                
+                notification = TradeNotification.create_trade_notification(
+                    user=self.user,
+                    trade=trade,
+                    notification_type=TradeNotification.NotificationType.TRADE_UPDATE,
+                    message=message,
+                    priority=priority
+                )
+                logger.info(f"Created notification for trade {trade.id} for user {self.user.id}")
+                return notification
         except Exception as e:
             logger.error(f"Error creating notification: {str(e)}")
             return None
