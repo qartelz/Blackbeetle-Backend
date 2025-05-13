@@ -272,7 +272,12 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                         newest = list(new_trades[:6])
                         # Combine both lists
                         result = previous + newest
-                        logger.info(f"BASIC user {self.user.id}: {len(previous)} previous trades, {len(newest)} new trades")
+                        logger.info(f"BASIC user {self.user.id}: {len(previous)} previous trades, {len(newest)} new trades, total: {len(result)}")
+                        
+                        # If no trades found, try to get any available trades
+                        if not result:
+                            result = list(base_query.order_by('-created_at')[:6])
+                            logger.info(f"No specific trades found for BASIC user {self.user.id}, getting latest 6 trades instead")
                     elif plan_name == 'PREMIUM':
                         # Get 6 previous trades
                         previous = list(previous_trades[:6])
@@ -280,10 +285,15 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                         newest = list(new_trades[:9])
                         # Combine both lists
                         result = previous + newest
-                        logger.info(f"PREMIUM user {self.user.id}: {len(previous)} previous trades, {len(newest)} new trades")
+                        logger.info(f"PREMIUM user {self.user.id}: {len(previous)} previous trades, {len(newest)} new trades, total: {len(result)}")
+                        
+                        # If no trades found, try to get any available trades
+                        if not result:
+                            result = list(base_query.order_by('-created_at')[:9])
+                            logger.info(f"No specific trades found for PREMIUM user {self.user.id}, getting latest 9 trades instead")
                     else:  # SUPER_PREMIUM or FREE_TRIAL
                         result = list(new_trades) + list(previous_trades)
-                        logger.info(f"{plan_name} user {self.user.id}: all trades")
+                        logger.info(f"{plan_name} user {self.user.id}: all trades, total: {len(result)}")
 
                     def format_trade(trade):
                         if not trade:
@@ -331,8 +341,8 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                             "updated_at": company.updated_at.isoformat()
                         }
 
-                    # Get unique companies from the filtered trades
-                    company_ids = result.values_list('company_id', flat=True).distinct()
+                    # Get unique company IDs from the filtered trades
+                    company_ids = set(trade.company_id for trade in result)
                     companies = Company.objects.filter(id__in=company_ids)
                     
                     company_items = [format_company(company) for company in companies]
