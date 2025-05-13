@@ -58,15 +58,30 @@ class TradeUpdateManager:
             "action": action,
             "trade_status": trade.status,
             "plan_type": trade.plan_type,
-            "update_type": "stock" if trade.is_stock_trade else "crypto",
-            "timestamp": timezone.now().isoformat()
+            "update_type": "stock" if trade.is_stock_trade else "index",
+            "timestamp": timezone.now().isoformat(),
+            "company": {
+                "id": trade.company.id,
+                "symbol": trade.company.trading_symbol,
+                "name": trade.company.script_name
+            },
+            "trade_type": trade.trade_type,
+            "warzone": str(trade.warzone),
+            "image": trade.image.url if trade.image else None
         }
     
     @classmethod
     def get_subscriber_groups(cls, trade: Trade) -> List[str]:
         """Get list of channel groups to broadcast to."""
-        accessible_plans = PlanConfig.get_accessible_plans(trade.plan_type)
-        return [f"trade_updates_{plan}" for plan in accessible_plans]
+        # Get all active subscriptions that can access this trade
+        subscriptions = Subscription.objects.filter(
+            is_active=True,
+            end_date__gt=timezone.now(),
+            plan__name__in=PlanConfig.get_accessible_plans(trade.plan_type)
+        )
+        
+        # Create group names for each user
+        return [f"trade_updates_{sub.user.id}" for sub in subscriptions]
 
 
 class TradeSignalHandler:
@@ -98,21 +113,25 @@ class TradeSignalHandler:
     def create_trade_notification(trade: Trade, action: str = "updated"):
         """Create notifications for relevant users."""
         try:
-            accessible_plans = PlanConfig.get_accessible_plans(trade.plan_type)
+            # Get all active subscriptions that can access this trade
             subscriptions = Subscription.objects.filter(
-                plan__name__in=accessible_plans,
                 is_active=True,
-                end_date__gt=timezone.now()
+                end_date__gt=timezone.now(),
+                plan__name__in=PlanConfig.get_accessible_plans(trade.plan_type)
             )
             
             for subscription in subscriptions:
-                TradeNotification.create_trade_notification(
-                    user=subscription.user,
-                    trade=trade,
-                    notification_type=TradeNotification.NotificationType.TRADE_UPDATE,
-                    message=f"Trade update for {trade.company.trading_symbol}: {action}",
-                    priority=TradeNotification.Priority.HIGH if trade.status == Trade.Status.ACTIVE else TradeNotification.Priority.NORMAL
-                )
+                try:
+                    TradeNotification.create_trade_notification(
+                        user=subscription.user,
+                        trade=trade,
+                        notification_type=TradeNotification.NotificationType.TRADE_UPDATE,
+                        message=f"Trade update for {trade.company.trading_symbol}: {action}",
+                        priority=TradeNotification.Priority.HIGH if trade.status == Trade.Status.ACTIVE else TradeNotification.Priority.NORMAL
+                    )
+                except Exception as e:
+                    logger.error(f"Error creating notification for user {subscription.user.id}: {str(e)}")
+                    continue
             
             logger.info(f"Created notifications for trade {trade.id} for {subscriptions.count()} users")
             
@@ -125,12 +144,18 @@ def handle_trade_update(sender, instance, created, **kwargs):
     """Handle trade updates and broadcast to relevant users."""
     try:
         action = "created" if created else "updated"
+        
+        # First broadcast the update
         TradeSignalHandler.broadcast_trade_update(instance, action)
+        
+        # Then create notifications
         TradeSignalHandler.create_trade_notification(instance, action)
         
-        # Clear relevant caches
+        # Finally clear relevant caches
         cache_key = TradeUpdateManager.get_cache_key(instance.user.id, instance.plan_type)
         cache.delete(cache_key)
+        
+        logger.info(f"Successfully handled trade update for trade {instance.id}")
         
     except Exception as e:
         logger.error(f"Error handling trade update signal: {str(e)}")
