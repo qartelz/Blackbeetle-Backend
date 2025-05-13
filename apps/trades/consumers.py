@@ -11,6 +11,8 @@ from urllib.parse import parse_qs
 from django.utils import timezone
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 
 logger = logging.getLogger(__name__)
 
@@ -302,382 +304,114 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             logger.error(f"Error sending initial data: {str(e)}")
 
     async def trade_update(self, event):
-        """Handle incoming trade update events from the channel layer."""
+        """Handle trade update messages."""
         try:
             if not self.is_connected or not self.subscription:
                 return
 
-            trade_data = event['data']
-            if trade_data['plan_type'] not in TradeUpdateManager.get_plan_levels(self.subscription.plan.name):
+            data = event["data"]
+            trade = await self.get_trade(data["trade_id"])
+
+            if not trade or not await self.is_trade_accessible(trade):
+                logger.warning(f"Trade {data['trade_id']} not accessible to user {self.user.id}")
                 return
 
-            cache_key = f"trades_data_{self.user.id}_{self.subscription.plan.name}"
-            cache.delete(cache_key)
+            # Create notification
+            await self.create_notification(trade, data)
 
-            action = trade_data['action']
-            current_status = trade_data['trade_status']
-            previous_status = trade_data.get('previous_status')
-            is_stock_trade = trade_data.get('update_type') == 'stock'
+            # Format and send trade update
+            trade_data = await self.format_trade_data(trade)
+            
+            # Add subscription info
+            response_data = {
+                "type": "trade_update",
+                "data": {
+                    **data,
+                    "trade": trade_data,
+                    "subscription": {
+                        "plan": self.subscription.plan.name,
+                        "expires_at": self.subscription.end_date.isoformat()
+                    }
+                }
+            }
 
-            if is_stock_trade and self.stock_limit is not None:
-                if action in ["created", "updated"] and current_status == "ACTIVE":
-                    if self.active_trade_count >= self.stock_limit:
-                        return
-                    self.active_trade_count += 1
-                elif action == "cancelled" and previous_status == "ACTIVE" and current_status != "ACTIVE":
-                    self.active_trade_count = max(0, self.active_trade_count - 1)
+            logger.info(f"Sending trade update to user {self.user.id}: {response_data}")
+            await self.send_json(response_data)
 
-            await self.send(text_data=json.dumps(trade_data, cls=DecimalEncoder))
-            await self.send_success("trade_update")
         except Exception as e:
             logger.error(f"Error handling trade update: {str(e)}")
+            await self.send_json({
+                "type": "error",
+                "data": {
+                    "message": "Error processing trade update",
+                    "error": str(e)
+                }
+            })
 
+    @database_sync_to_async
+    def get_trade(self, trade_id):
+        """Get trade by ID with optimized query."""
+        try:
+            return Trade.objects.select_related(
+                'company',
+                'analysis'
+            ).prefetch_related(
+                'history'
+            ).get(id=trade_id)
+        except Trade.DoesNotExist:
+            logger.warning(f"Trade {trade_id} not found")
+            return None
 
+    @database_sync_to_async
+    def is_trade_accessible(self, trade):
+        """Check if user has access to the trade."""
+        try:
+            return trade.is_accessible_to_user(self.user)
+        except Exception as e:
+            logger.error(f"Error checking trade access: {str(e)}")
+            return False
 
-#  this done by me sidharth
-# from channels.generic.websocket import AsyncWebsocketConsumer
-# from asgiref.sync import sync_to_async
-# from django.core.cache import cache
-# from datetime import datetime
-# from decimal import Decimal
-# from django.utils import timezone
-# import json
-# import logging
-# from typing import Dict, Optional
+    @database_sync_to_async
+    def create_notification(self, trade, data):
+        """Create a notification for the trade update."""
+        try:
+            message = f"Trade update for {trade.company.trading_symbol}: {data.get('action', 'updated')}"
+            priority = TradeNotification.Priority.HIGH if data.get("trade_status") == Trade.Status.ACTIVE else TradeNotification.Priority.NORMAL
+            
+            notification = TradeNotification.create_trade_notification(
+                user=self.user,
+                trade=trade,
+                notification_type=TradeNotification.NotificationType.TRADE_UPDATE,
+                message=message,
+                priority=priority
+            )
+            logger.info(f"Created notification for trade {trade.id} for user {self.user.id}")
+            return notification
+        except Exception as e:
+            logger.error(f"Error creating notification: {str(e)}")
+            return None
 
-# from apps.subscriptions.models import Subscription
-# from apps.users.models import User
-# from apps.trades.models import Trade
-# from rest_framework_simplejwt.authentication import JWTAuthentication
-# from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
+    async def format_trade_data(self, trade):
+        """Format trade data for WebSocket response."""
+        return {
+            "id": trade.id,
+            "company": {
+                "id": trade.company.id,
+                "symbol": trade.company.trading_symbol,
+                "name": trade.company.script_name
+            },
+            "status": trade.status,
+            "action": trade.action,
+            "plan_type": trade.plan_type,
+            "created_at": trade.created_at.isoformat(),
+            "updated_at": trade.updated_at.isoformat(),
+            "analysis": {
+                "sentiment": trade.analysis.status if hasattr(trade, 'analysis') else None,
+                "bull_scenario": trade.analysis.bull_scenario if hasattr(trade, 'analysis') else None,
+                "bear_scenario": trade.analysis.bear_scenario if hasattr(trade, 'analysis') else None
+            } if hasattr(trade, 'analysis') else None
+        }
 
-# logger = logging.getLogger(__name__)
-
-
-# class DecimalEncoder(json.JSONEncoder):
-#     def default(self, obj):
-#         if isinstance(obj, Decimal):
-#             return str(obj)
-#         return super().default(obj)
-
-
-# class TradeUpdateManager:
-#     CACHE_TIMEOUT = 3600
-
-#     @staticmethod
-#     async def get_cached_trades(cache_key: str) -> Optional[Dict]:
-#         try:
-#             return await sync_to_async(cache.get)(cache_key)
-#         except Exception as e:
-#             logger.error(f"Failed to get cached trades: {str(e)}")
-#             return None
-
-#     @staticmethod
-#     async def set_cached_trades(cache_key: str, data: Dict):
-#         try:
-#             await sync_to_async(cache.set)(cache_key, data, TradeUpdateManager.CACHE_TIMEOUT)
-#         except Exception as e:
-#             logger.error(f"Failed to set cached trades: {str(e)}")
-
-
-# class TradeUpdatesConsumer(AsyncWebsocketConsumer):
-#     RECONNECT_DELAY = 2
-#     MAX_RETRIES = 3
-
-#     ERROR_MESSAGES = {
-#         4001: "No authentication token provided. Please log in and try again.",
-#         4002: "Invalid or expired token. Please log in again.",
-#         4003: "Authentication failed. Please verify your credentials.",
-#         4004: "An unexpected error occurred during authentication.",
-#         4005: "No active subscription found. Please subscribe to continue.",
-#         4006: "Failed to set up trade updates. Please try again later.",
-#         4007: "Maximum connection retries exceeded. Please check your network and try again."
-#     }
-
-#     SUCCESS_MESSAGES = {
-#         "connected": "Successfully connected to trade updates.",
-#         "initial_data": "Initial trade data loaded successfully.",
-#         "trade_update": "Trade update received successfully."
-#     }
-
-#     def __init__(self, *args, **kwargs):
-#         super().__init__(*args, **kwargs)
-#         self.user = None
-#         self.subscription = None
-#         self.trade_manager = TradeUpdateManager()
-#         self.is_connected = False
-#         self.connection_retries = 0
-#         self.stock_limit = None
-#         self.user_group = None
-
-#     async def connect(self):
-#         if self.connection_retries >= self.MAX_RETRIES:
-#             await self.send_error(4007)
-#             await self.close(code=4007)
-#             return
-
-#         headers = dict((k.decode(), v.decode()) for k, v in self.scope.get("headers", []))
-#         token = headers.get("authorization", None)
-#         if not token:
-#             await self.send_error(4001)
-#             await self.close(code=4001)
-#             return
-
-#         try:
-#             decoded_token = JWTAuthentication().get_validated_token(token.split(" ")[1])
-#             self.user = await self.get_user_from_token(decoded_token)
-
-#             if not self.user:
-#                 await self.send_error(4003)
-#                 await self.close(code=4003)
-#                 return
-
-#             self.subscription = await self.get_user_subscription(self.user)
-#             if not self.subscription:
-#                 await self.send_error(4005)
-#                 await self.close(code=4005)
-#                 return
-
-#             self.stock_limit = await self.get_trade_limit_for_user(self.user, self.subscription.start_date)
-
-#             self.is_connected = True
-#             await self.accept()
-#             await self.send_initial_data()
-
-#         except (InvalidToken, TokenError):
-#             await self.send_error(4002)
-#             await self.close(code=4002)
-#         except Exception as e:
-#             logger.error(f"Connection failed: {e}")
-#             await self.send_error(4004)
-#             await self.close(code=4004)
-
-#     async def disconnect(self, close_code):
-#         if self.user_group:
-#             await self.channel_layer.group_discard(self.user_group, self.channel_name)
-#         self.is_connected = False
-#         self.connection_retries = 0
-#         logger.info(f"Disconnected: {self.user} with code {close_code}")
-
-#     async def send_error(self, error_code: int):
-#         await self.send(text_data=json.dumps({
-#             "status": "error",
-#             "message": self.ERROR_MESSAGES.get(error_code, "Unknown error")
-#         }))
-
-#     async def send_initial_data(self):
-#         await self.send(text_data=json.dumps({
-#             "status": "success",
-#             "message": self.SUCCESS_MESSAGES["connected"],
-#             "trade_limit": self.stock_limit
-#         }))
-
-#     async def receive(self, text_data):
-#         # Placeholder for future data handling logic
-#         data = json.loads(text_data)
-#         logger.info(f"Received data from {self.user}: {data}")
-#         await self.send(text_data=json.dumps({
-#             "status": "success",
-#             "message": self.SUCCESS_MESSAGES["trade_update"],
-#             "echo": data
-#         }))
-
-#     async def get_user_from_token(self, decoded_token):
-#         try:
-#             return await sync_to_async(User.objects.get)(id=decoded_token['user_id'])
-#         except User.DoesNotExist:
-#             return None
-
-#     async def get_user_subscription(self, user):
-#         return await sync_to_async(lambda: Subscription.objects.filter(user=user, is_active=True).first())()
-
-#     @staticmethod
-#     async def get_trade_limit_for_user(user: User, subscription_date: datetime) -> int:
-#         trades_qs = Trade.objects.filter(user=user, created_at__gte=subscription_date)
-#         trade_count = await sync_to_async(trades_qs.count)()
-
-#         if user.membership_type == User.BASIC:
-#             return max(0, 6 - trade_count)
-#         elif user.membership_type == User.PREMIUM:
-#             return max(0, 9 - trade_count)
-#         elif user.membership_type == User.SUPREMIUM:
-#             return float('inf')
-#         return 0
-
-
-
-# from channels.generic.websocket import AsyncWebsocketConsumer
-# from asgiref.sync import sync_to_async
-# from django.core.cache import cache
-# from typing import Dict, List, Optional
-# import json
-# from decimal import Decimal
-# from datetime import timedelta
-# import logging
-# import asyncio
-
-# from subscriptions.models import Subscription
-# from users.models import User
-# from urllib.parse import parse_qs
-# from django.utils import timezone
-# from rest_framework_simplejwt.authentication import JWTAuthentication
-# from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
-
-# logger = logging.getLogger(__name__)
-
-# class DecimalEncoder(json.JSONEncoder):
-#     """
-#     Custom JSON encoder to handle Decimal objects.
-#     """
-#     def default(self, obj):
-#         if isinstance(obj, Decimal):
-#             return str(obj)
-#         return super().default(obj)
-
-
-# class TradeUpdateManager:
-#     """Utility class for managing trade caching and plan level access."""
-    
-#     CACHE_TIMEOUT = 3600  # Cache duration in seconds (1 hour)
-#     RETRY_DELAY = 0.5     # Delay between retry attempts in seconds
-
-#     @staticmethod
-#     async def get_cached_trades(cache_key: str) -> Optional[Dict]:
-#         """Retrieve cached trade data asynchronously."""
-#         try:
-#             return await sync_to_async(cache.get)(cache_key)
-#         except Exception as e:
-#             logger.error(f"Failed to get cached trades: {str(e)}")
-#             return None
-
-#     @staticmethod
-#     async def set_cached_trades(cache_key: str, data: Dict):
-#         """Store trade data in the cache asynchronously."""
-#         try:
-#             await sync_to_async(cache.set)(cache_key, data, TradeUpdateManager.CACHE_TIMEOUT)
-#         except Exception as e:
-#             logger.error(f"Failed to set cached trades: {str(e)}")
-
-#     @staticmethod
-#     def get_plan_levels(plan_type: str) -> List[str]:
-#         """Get accessible plan levels for a given plan type."""
-#         return {
-#             'BASIC': ['BASIC'],
-#             'PREMIUM': ['BASIC', 'PREMIUM'],
-#             'SUPER_PREMIUM': ['BASIC', 'PREMIUM', 'SUPER_PREMIUM']
-#         }.get(plan_type, [])
-
-
-# class TradeUpdatesConsumer(AsyncWebsocketConsumer):
-#     """
-#     WebSocket consumer for delivering real-time trade updates to authenticated users.
-#     """
-    
-#     RECONNECT_DELAY = 2   # Delay between reconnection attempts in seconds
-#     MAX_RETRIES = 3       # Maximum number of reconnection attempts
-
-#     ERROR_MESSAGES = {
-#         4001: "No authentication token provided. Please log in and try again.",
-#         4002: "Invalid or expired token. Please log in again.",
-#         4003: "Authentication failed. Please verify your credentials.",
-#         4004: "An unexpected error occurred during authentication.",
-#         4005: "No active subscription found. Please subscribe to continue.",
-#         4006: "Failed to set up trade updates. Please try again later.",
-#         4007: "Maximum connection retries exceeded. Please check your network and try again."
-#     }
-
-#     SUCCESS_MESSAGES = {
-#         "connected": "Successfully connected to trade updates.",
-#         "initial_data": "Initial trade data loaded successfully.",
-#         "trade_update": "Trade update received successfully."
-#     }
-
-#     def __init__(self, *args, **kwargs):
-#         """Initialize the consumer with default attributes."""
-#         super().__init__(*args, **kwargs)
-#         self.user = None
-#         self.subscription = None
-#         self.trade_manager = TradeUpdateManager()
-#         self.is_connected = False
-#         self.connection_retries = 0
-#         self.active_trade_count = 0
-#         self.stock_limit = None
-#         self.user_group = None
-#         self._initial_data_task = None
-
-#     async def connect(self):
-#         """
-#         Handle WebSocket connection establishment.
-#         """
-#         if self.connection_retries >= self.MAX_RETRIES:
-#             await self.send_error(4007)
-#             await self.close(code=4007)
-#             return
-
-#         token = self.scope.get('headers', {}).get('Authorization', None)
-#         if not token:
-#             await self.send_error(4001)
-#             await self.close(code=4001)
-#             return
-
-#         try:
-#             decoded_token = JWTAuthentication().decode(token)
-#             self.user = await self.get_user_from_token(decoded_token)
-#             if not self.user:
-#                 await self.send_error(4003)
-#                 await self.close(code=4003)
-#                 return
-#             self.is_connected = True
-#             self.subscription = await self.get_user_subscription(self.user)
-#             if not self.subscription:
-#                 await self.send_error(4005)
-#                 await self.close(code=4005)
-#                 return
-
-#             await self.accept()
-#             await self.send_initial_data()
-#         except (InvalidToken, TokenError):
-#             await self.send_error(4002)
-#             await self.close(code=4002)
-#         except Exception as e:
-#             logger.error(f"Connection failed: {e}")
-#             await self.send_error(4004)
-#             await self.close(code=4004)
-
-#     async def disconnect(self, _):
-#         """Handle WebSocket disconnection."""
-#         if self.user_group:
-#             await self.channel_layer.group_discard(self.user_group, self.channel_name)
-#         self.is_connected = False
-#         self.connection_retries = 0
-#         logger.info(f"Disconnected: {self.user}")
-
-#     async def send_error(self, error_code: int):
-#         """Send an error message to the client."""
-#         await self.send(text_data=json.dumps({"error": self.ERROR_MESSAGES.get(error_code, "Unknown error")}))
-
-#     async def send_initial_data(self):
-#         """
-#         Send initial trade data to the user upon successful connection.
-#         """
-#         await self.send(text_data=json.dumps({"status": self.SUCCESS_MESSAGES["connected"]}))
-
-#     async def receive(self, text_data):
-#         """Handle incoming messages from the WebSocket."""
-#         pass
-
-#     async def _send_trade_data(self, trade_data):
-#         """Send trade data to the connected user."""
-#         await self.send(text_data=json.dumps(trade_data))
-
-#     async def _authenticate(self, token):
-#         """Authenticate the user with the provided token."""
-#         return await sync_to_async(self.authenticate_token)(token)
-    
-#     async def get_user_subscription(self, user):
-#         """Get the user's active subscription from the database."""
-#         return await sync_to_async(Subscription.objects.filter)(user=user, is_active=True).first()
-
-#     async def get_user_from_token(self, decoded_token):
-#         """Get user from JWT token.""" 
-#         return await sync_to_async(User.objects.get)(id=decoded_token['user_id'])
+    async def send_json(self, data):
+        """Send JSON data to WebSocket."""
+        await self.send(text_data=json.dumps(data, cls=DecimalEncoder))

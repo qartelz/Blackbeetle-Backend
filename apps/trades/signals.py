@@ -1,460 +1,136 @@
 from django.db.models.signals import post_save
 from django.dispatch import receiver
-from channels.layers import get_channel_layer
-from asgiref.sync import async_to_sync, sync_to_async
-from .models import Trade
-from apps.indexAndCommodity.models import Trade as IndexAndCommodityTrade
-from .serializers.tradeconsumer_serializers import CompanySerializer, IndexAndCommoditySeraializer
-from apps.subscriptions.models import Subscription
-import logging
+from django.core.cache import cache
 from django.utils import timezone
-from functools import lru_cache
-from typing import Dict, List, Any
-from dataclasses import dataclass
-import asyncio
+from channels.layers import get_channel_layer
+from asgiref.sync import async_to_sync
+import logging
+from typing import Dict, List, Optional
+from datetime import timedelta
+
+from .models import Trade, TradeNotification
+from apps.subscriptions.models import Subscription
 
 logger = logging.getLogger(__name__)
 
-@dataclass
 class PlanConfig:
-    """Represents configuration for subscription plan access levels."""
-    levels: List[str]  # List of plan types that can access this trade
+    """Configuration for subscription plan access levels."""
+    
+    PLAN_LEVELS = {
+        'BASIC': ['BASIC'],
+        'PREMIUM': ['BASIC', 'PREMIUM'],
+        'SUPER_PREMIUM': ['BASIC', 'PREMIUM', 'SUPER_PREMIUM']
+    }
+    
+    TRADE_LIMITS = {
+        'BASIC': 6,
+        'PREMIUM': 15,
+        'SUPER_PREMIUM': float('inf')
+    }
+    
+    @classmethod
+    def get_accessible_plans(cls, plan_type: str) -> List[str]:
+        """Get list of accessible plan types for a given plan."""
+        return cls.PLAN_LEVELS.get(plan_type, [])
+    
+    @classmethod
+    def get_trade_limit(cls, plan_type: str) -> int:
+        """Get trade limit for a given plan type."""
+        return cls.TRADE_LIMITS.get(plan_type, 0)
 
 
 class TradeUpdateManager:
-    """Utility class for managing trade update logic and configurations."""
-
-    @staticmethod
-    @lru_cache(maxsize=3)
-    def get_plan_configs(plan_type: str) -> PlanConfig:
-        """Retrieve cached plan configuration for a given plan type."""
-        configs = {
-            'BASIC': PlanConfig(['BASIC', 'PREMIUM', 'SUPER_PREMIUM']),
-            'PREMIUM': PlanConfig(['PREMIUM', 'SUPER_PREMIUM']),
-            'SUPER_PREMIUM': PlanConfig(['SUPER_PREMIUM'])
-        }
-        return configs.get(plan_type, PlanConfig([]))
-
-    @staticmethod
-    async def prepare_trade_data(
-        instance: Any,
-        serializer_class: Any,
-        update_type: str,
-        created: bool
-    ) -> Dict[str, Any]:
-        """Prepare the trade update data payload for broadcasting."""
-        parent_object = instance.company if update_type == "stock" else instance.index_and_commodity
-        action = (
-            "created" if created and instance.status == "ACTIVE"
-            else "cancelled" if instance.status in ["CANCELLED", "DELETED", "PENDING", "COMPLETED"]
-            else "updated"
-        )
-        previous_status = instance.tracker.previous('status') if not created else None
-
-        # Wrap serializer.data in sync_to_async since it's a sync operation
-        serializer_data = await sync_to_async(lambda: serializer_class(parent_object).data)()
-
+    """Manages trade updates and caching."""
+    
+    CACHE_TIMEOUT = 3600  # 1 hour
+    CACHE_PREFIX = "trade_updates_"
+    
+    @classmethod
+    def get_cache_key(cls, user_id: int, plan_type: str) -> str:
+        """Generate cache key for user's trade updates."""
+        return f"{cls.CACHE_PREFIX}{user_id}_{plan_type}"
+    
+    @classmethod
+    def prepare_trade_data(cls, trade: Trade, action: str = "updated") -> Dict:
+        """Prepare trade data for broadcasting."""
         return {
-            "update_type": update_type,
+            "trade_id": trade.id,
             "action": action,
-            "data": serializer_data,
-            "plan_type": instance.plan_type,
-            "trade_status": instance.status,
-            "trade_id": instance.id,
-            "is_realtime": True,
-            "previous_status": previous_status,
+            "trade_status": trade.status,
+            "plan_type": trade.plan_type,
+            "update_type": "stock" if trade.is_stock_trade else "crypto",
+            "timestamp": timezone.now().isoformat()
         }
+    
+    @classmethod
+    def get_subscriber_groups(cls, trade: Trade) -> List[str]:
+        """Get list of channel groups to broadcast to."""
+        accessible_plans = PlanConfig.get_accessible_plans(trade.plan_type)
+        return [f"trade_updates_{plan}" for plan in accessible_plans]
 
 
 class TradeSignalHandler:
-    """Handles broadcasting trade updates to subscribed users via WebSocket groups."""
-
-    _pending_updates = {}  # For debouncing
-
+    """Handles trade-related signals and broadcasts updates."""
+    
     @staticmethod
-    @lru_cache(maxsize=128)
-    def _get_subscriber_groups_cached(plan_levels: tuple, timestamp: int) -> List[str]:
-        """Fetch cached group names for subscribers with access to the given plan levels."""
-        now = timezone.now()
-        trade_time = timezone.datetime.fromtimestamp(timestamp, tz=timezone.utc)
-
-        subscriptions = Subscription.objects.filter(
-            plan__name__in=plan_levels,
-            is_active=True,
-            start_date__lte=now,
-            end_date__gte=now,
-            # start_date__lte=trade_time
-        ).select_related('user').prefetch_related('user__notification_preferences')
-
-        # Filter users based on notification preferences
-        valid_subscriptions = []
-        for sub in subscriptions:
-            user = sub.user
-            if hasattr(user, 'notification_preferences'):
-                prefs = user.notification_preferences
-                if prefs.enable_trade_updates and prefs.enable_realtime_updates:
-                    valid_subscriptions.append(sub)
-
-        return [f"trade_updates_{sub.user.id}" for sub in valid_subscriptions]
-
-    @staticmethod
-    async def _get_subscriber_groups(plan_levels: List[str], trade_time) -> List[str]:
-        """Get subscriber groups with 5-minute caching, async-compatible."""
-        return await sync_to_async(TradeSignalHandler._get_subscriber_groups_cached)(
-            tuple(plan_levels), int(trade_time.timestamp())
-        )
-
-    @staticmethod
-    async def debounce_send(instance, update_type, serializer_class):
-        """Debounce trade updates to batch within 100ms."""
-        key = f"{update_type}_{instance.id}"
-        if key not in TradeSignalHandler._pending_updates:
-            TradeSignalHandler._pending_updates[key] = instance
-            await asyncio.sleep(0.1)  # 100ms debounce
-            instance = TradeSignalHandler._pending_updates.pop(key)
-            await TradeSignalHandler.send_trade_update(instance, False, update_type, serializer_class)
-
-    @staticmethod
-    async def send_trade_update(
-        instance: Any,
-        created: bool,
-        update_type: str,
-        serializer_class: Any
-    ):
-        """Send trade update notifications to relevant subscriber groups."""
+    def broadcast_trade_update(trade: Trade, action: str = "updated"):
+        """Broadcast trade update to relevant subscribers."""
         try:
-            if created:  # Skip new trade creation
-                return
-
-            trade_data = await TradeUpdateManager.prepare_trade_data(instance, serializer_class, update_type, created)
-            plan_config = await sync_to_async(TradeUpdateManager.get_plan_configs)(instance.plan_type)
-            if not plan_config.levels:
-                return
-
-            trade_time = instance.created_at if hasattr(instance, 'created_at') else timezone.now()
-            group_names = await TradeSignalHandler._get_subscriber_groups(plan_config.levels, trade_time)
-            
-            if not group_names:
-                return
-
             channel_layer = get_channel_layer()
-            message = {
-                "type": "trade_update",
-                "data": {
-                    **trade_data,
-                    "notification_type": "trade_update",
-                    "priority": "high" if instance.status == Trade.Status.ACTIVE else "normal"
-                }
-            }
-
-            # Send to groups in chunks
-            chunk_size = 50
-            for i in range(0, len(group_names), chunk_size):
-                chunk = group_names[i:i + chunk_size]
-                tasks = [channel_layer.group_send(group, message) for group in chunk]
-                await asyncio.gather(*tasks)
-
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"Sent {update_type} update to {len(group_names)} subscribers")
-
+            trade_data = TradeUpdateManager.prepare_trade_data(trade, action)
+            groups = TradeUpdateManager.get_subscriber_groups(trade)
+            
+            for group in groups:
+                async_to_sync(channel_layer.group_send)(
+                    group,
+                    {
+                        "type": "trade_update",
+                        "data": trade_data
+                    }
+                )
+            
+            logger.info(f"Broadcast trade update for {trade.id} to {len(groups)} groups")
+            
         except Exception as e:
-            logger.error(f"Failed to send {update_type} update: {str(e)}")
+            logger.error(f"Error broadcasting trade update: {str(e)}")
+    
+    @staticmethod
+    def create_trade_notification(trade: Trade, action: str = "updated"):
+        """Create notifications for relevant users."""
+        try:
+            accessible_plans = PlanConfig.get_accessible_plans(trade.plan_type)
+            subscriptions = Subscription.objects.filter(
+                plan__name__in=accessible_plans,
+                is_active=True,
+                end_date__gt=timezone.now()
+            )
+            
+            for subscription in subscriptions:
+                TradeNotification.create_trade_notification(
+                    user=subscription.user,
+                    trade=trade,
+                    notification_type=TradeNotification.NotificationType.TRADE_UPDATE,
+                    message=f"Trade update for {trade.company.trading_symbol}: {action}",
+                    priority=TradeNotification.Priority.HIGH if trade.status == Trade.Status.ACTIVE else TradeNotification.Priority.NORMAL
+                )
+            
+            logger.info(f"Created notifications for trade {trade.id} for {subscriptions.count()} users")
+            
+        except Exception as e:
+            logger.error(f"Error creating trade notifications: {str(e)}")
 
 
 @receiver(post_save, sender=Trade)
-def notify_trade_update(sender, instance, created, **kwargs):
-    """Signal receiver for stock trade updates."""
-    if not created:
-        try:
-            async_to_sync(TradeSignalHandler.debounce_send)(instance, "stock", CompanySerializer)
-        except Exception as e:
-            logger.error(f"Failed to notify stock trade update for trade {instance.id}: {str(e)}")
-
-
-@receiver(post_save, sender=IndexAndCommodityTrade)
-def notify_index_trade_update(sender, instance, created, **kwargs):
-    """Signal receiver for index/commodity trade updates."""
-    if not created:
-        try:
-            async_to_sync(TradeSignalHandler.debounce_send)(instance, "index", IndexAndCommoditySeraializer)
-        except Exception as e:
-            logger.error(f"Failed to notify index/commodity trade update for trade {instance.id}: {str(e)}")
-
-
-
-# this is done by me sidharth uodated signals
-
-# from django.db.models.signals import post_save
-# from django.dispatch import receiver
-# from channels.layers import get_channel_layer
-# from asgiref.sync import async_to_sync, sync_to_async
-# from .models import Trade
-# from apps.indexAndCommodity.models import Trade as IndexAndCommodityTrade
-# from .serializers.tradeconsumer_serializers import CompanySerializer, IndexAndCommoditySeraializer
-# from apps.subscriptions.models import Subscription
-# import logging
-# from django.utils import timezone
-# from functools import lru_cache
-# from typing import Dict, List, Any
-# from dataclasses import dataclass
-# import asyncio
-
-# logger = logging.getLogger(__name__)
-
-# @dataclass
-# class PlanConfig:
-#     levels: List[str]
-
-# class TradeUpdateManager:
-
-#     @staticmethod
-#     @lru_cache(maxsize=3)
-#     def get_plan_configs(plan_type: str) -> PlanConfig:
-#         configs = {
-#             'BASIC': PlanConfig(['BASIC', 'PREMIUM', 'SUPER_PREMIUM']),
-#             'PREMIUM': PlanConfig(['PREMIUM', 'SUPER_PREMIUM']),
-#             'SUPER_PREMIUM': PlanConfig(['SUPER_PREMIUM'])
-#         }
-#         return configs.get(plan_type, PlanConfig([]))
-
-#     @staticmethod
-#     async def prepare_trade_data(instance: Any, serializer_class: Any, update_type: str, created: bool) -> Dict[str, Any]:
-#         parent_object = instance.company if update_type == "stock" else instance.index_and_commodity
-#         action = (
-#             "created" if created and instance.status == "ACTIVE"
-#             else "cancelled" if instance.status in ["CANCELLED", "DELETED", "PENDING", "COMPLETED"]
-#             else "updated"
-#         )
-#         previous_status = instance.tracker.previous('status') if not created else None
-#         serializer_data = await sync_to_async(lambda: serializer_class(parent_object).data)()
-
-#         return {
-#             "update_type": update_type,
-#             "action": action,
-#             "data": serializer_data,
-#             "plan_type": instance.plan_type,
-#             "trade_status": instance.status,
-#             "trade_id": instance.id,
-#             "is_realtime": True,
-#             "previous_status": previous_status,
-#         }
-
-# class TradeSignalHandler:
-#     _pending_updates = {}
-
-#     @staticmethod
-#     @lru_cache(maxsize=128)
-#     def _get_subscriber_groups_cached(plan_levels: tuple, timestamp: int) -> List[str]:
-#         trade_time = timezone.datetime.fromtimestamp(timestamp, tz=timezone.utc)
-#         now = timezone.now()
-
-#         subscriptions = Subscription.objects.filter(
-#             plan__name__in=plan_levels,
-#             is_active=True,
-#             start_date__lte=now,
-#             end_date__gte=now,
-#             start_date__lte=trade_time  
-#         ).values_list('user__id', flat=True)
-
-#         return [f"trade_updates_{user_id}" for user_id in subscriptions]
-
-#     @staticmethod
-#     async def _get_subscriber_groups(plan_levels: List[str], trade_time) -> List[str]:
-#         return await sync_to_async(TradeSignalHandler._get_subscriber_groups_cached)(
-#             tuple(plan_levels), int(trade_time.timestamp())
-#         )
-
-#     @staticmethod
-#     async def debounce_send(instance, update_type, serializer_class):
-#         key = f"{update_type}_{instance.id}"
-#         if key not in TradeSignalHandler._pending_updates:
-#             TradeSignalHandler._pending_updates[key] = instance
-#             await asyncio.sleep(0.1)
-#             instance = TradeSignalHandler._pending_updates.pop(key)
-#             await TradeSignalHandler.send_trade_update(instance, False, update_type, serializer_class)
-
-#     @staticmethod
-#     async def send_trade_update(instance: Any, created: bool, update_type: str, serializer_class: Any):
-#         try:
-#             if created:
-#                 return
-
-#             trade_data = await TradeUpdateManager.prepare_trade_data(instance, serializer_class, update_type, created)
-#             plan_config = await sync_to_async(TradeUpdateManager.get_plan_configs)(instance.plan_type)
-#             if not plan_config.levels:
-#                 return
-
-#             trade_time = instance.created_at if hasattr(instance, 'created_at') else timezone.now()
-
-#             group_names = await TradeSignalHandler._get_subscriber_groups(plan_config.levels, trade_time)
-#             if not group_names:
-#                 return
-
-#             channel_layer = get_channel_layer()
-#             message = {"type": "trade_update", "data": trade_data}
-
-#             chunk_size = 50
-#             for i in range(0, len(group_names), chunk_size):
-#                 chunk = group_names[i:i + chunk_size]
-#                 tasks = [channel_layer.group_send(group, message) for group in chunk]
-#                 await asyncio.gather(*tasks)
-
-#             if logger.isEnabledFor(logging.DEBUG):
-#                 logger.debug(f"Sent {update_type} update to {len(group_names)} subscribers")
-
-#         except Exception as e:
-#             logger.error(f"Failed to send {update_type} update: {str(e)}")
-
-# @receiver(post_save, sender=Trade)
-# def notify_trade_update(sender, instance, created, **kwargs):
-#     if not created:
-#         try:
-#             async_to_sync(TradeSignalHandler.debounce_send)(instance, "stock", CompanySerializer)
-#         except Exception as e:
-#             logger.error(f"Failed to notify stock trade update for trade {instance.id}: {str(e)}")
-
-# @receiver(post_save, sender=IndexAndCommodityTrade)
-# def notify_index_trade_update(sender, instance, created, **kwargs):
-#     if not created:
-#         try:
-#             async_to_sync(TradeSignalHandler.debounce_send)(instance, "index", IndexAndCommoditySeraializer)
-#         except Exception as e:
-#             logger.error(f"Failed to notify index/commodity trade update for trade {instance.id}: {str(e)}")
-
-
-# # from django.db.models.signals import post_save
-# # from django.dispatch import receiver
-# # from channels.layers import get_channel_layer
-# # from asgiref.sync import async_to_sync, sync_to_async
-# # from .models import Trade
-# # from apps.indexAndCommodity.models import Trade as IndexAndCommodityTrade
-# # from .serializers.tradeconsumer_serializers import CompanySerializer, IndexAndCommoditySeraializer
-# # from apps.subscriptions.models import Subscription
-# # import logging
-# # from django.utils import timezone
-# # from functools import lru_cache
-# # from typing import Dict, List, Any
-# # from dataclasses import dataclass
-# # import asyncio
-
-# # logger = logging.getLogger(__name__)
-
-# # @dataclass
-# # class PlanConfig:
-# #     levels: List[str]
-
-# # class TradeUpdateManager:
-
-# #     @staticmethod
-# #     @lru_cache(maxsize=3)
-# #     def get_plan_configs(plan_type: str) -> PlanConfig:
-# #         configs = {
-# #             'BASIC': PlanConfig(['BASIC', 'PREMIUM', 'SUPER_PREMIUM']),
-# #             'PREMIUM': PlanConfig(['PREMIUM', 'SUPER_PREMIUM']),
-# #             'SUPER_PREMIUM': PlanConfig(['SUPER_PREMIUM'])
-# #         }
-# #         return configs.get(plan_type, PlanConfig([]))
-
-# #     @staticmethod
-# #     async def prepare_trade_data(instance: Any, serializer_class: Any, update_type: str, created: bool) -> Dict[str, Any]:
-# #         parent_object = instance.company if update_type == "stock" else instance.index_and_commodity
-# #         action = (
-# #             "created" if created and instance.status == "ACTIVE"
-# #             else "cancelled" if instance.status in ["CANCELLED", "DELETED", "PENDING", "COMPLETED"]
-# #             else "updated"
-# #         )
-# #         previous_status = instance.tracker.previous('status') if not created else None
-# #         serializer_data = await sync_to_async(lambda: serializer_class(parent_object).data)()
-
-# #         return {
-# #             "update_type": update_type,
-# #             "action": action,
-# #             "data": serializer_data,
-# #             "plan_type": instance.plan_type,
-# #             "trade_status": instance.status,
-# #             "trade_id": instance.id,
-# #             "is_realtime": True,
-# #             "previous_status": previous_status,
-# #         }
-
-# # class TradeSignalHandler:
-# #     _pending_updates = {}
-
-# #     @staticmethod
-# #     @lru_cache(maxsize=128)
-# #     def _get_subscriber_groups_cached(plan_levels: tuple, timestamp: int) -> List[str]:
-# #         trade_time = timezone.datetime.fromtimestamp(timestamp, tz=timezone.utc)
-# #         now = timezone.now()
-
-# #         subscriptions = Subscription.objects.filter(
-# #             plan__name__in=plan_levels,
-# #             is_active=True,
-# #             # start_date__lte=now,
-# #             end_date__gte=now,
-# #             start_date__lte=trade_time  
-# #         ).values_list('user__id', flat=True)
-
-# #         return [f"trade_updates_{user_id}" for user_id in subscriptions]
-
-# #     @staticmethod
-# #     async def _get_subscriber_groups(plan_levels: List[str], trade_time) -> List[str]:
-# #         return await sync_to_async(TradeSignalHandler._get_subscriber_groups_cached)(
-# #             tuple(plan_levels), int(trade_time.timestamp())
-# #         )
-
-# #     @staticmethod
-# #     async def debounce_send(instance, update_type, serializer_class):
-# #         key = f"{update_type}_{instance.id}"
-# #         if key not in TradeSignalHandler._pending_updates:
-# #             TradeSignalHandler._pending_updates[key] = instance
-# #             await asyncio.sleep(0.1)
-# #             instance = TradeSignalHandler._pending_updates.pop(key)
-# #             await TradeSignalHandler.send_trade_update(instance, False, update_type, serializer_class)
-
-# #     @staticmethod
-# #     async def send_trade_update(instance: Any, created: bool, update_type: str, serializer_class: Any):
-# #         try:
-# #             if created:
-# #                 return
-
-# #             trade_data = await TradeUpdateManager.prepare_trade_data(instance, serializer_class, update_type, created)
-# #             plan_config = await sync_to_async(TradeUpdateManager.get_plan_configs)(instance.plan_type)
-# #             if not plan_config.levels:
-# #                 return
-
-# #             trade_time = instance.created_at if hasattr(instance, 'created_at') else timezone.now()
-
-# #             group_names = await TradeSignalHandler._get_subscriber_groups(plan_config.levels, trade_time)
-# #             if not group_names:
-# #                 return
-
-# #             channel_layer = get_channel_layer()
-# #             message = {"type": "trade_update", "data": trade_data}
-
-# #             chunk_size = 50
-# #             for i in range(0, len(group_names), chunk_size):
-# #                 chunk = group_names[i:i + chunk_size]
-# #                 tasks = [channel_layer.group_send(group, message) for group in chunk]
-# #                 await asyncio.gather(*tasks)
-
-# #             if logger.isEnabledFor(logging.DEBUG):
-# #                 logger.debug(f"Sent {update_type} update to {len(group_names)} subscribers")
-
-# #         except Exception as e:
-# #             logger.error(f"Failed to send {update_type} update: {str(e)}")
-
-# # @receiver(post_save, sender=Trade)
-# # def notify_trade_update(sender, instance, created, **kwargs):
-# #     if not created:
-# #         try:
-# #             async_to_sync(TradeSignalHandler.debounce_send)(instance, "stock", CompanySerializer)
-# #         except Exception as e:
-# #             logger.error(f"Failed to notify stock trade update for trade {instance.id}: {str(e)}")
-
-# # @receiver(post_save, sender=IndexAndCommodityTrade)
-# # def notify_index_trade_update(sender, instance, created, **kwargs):
-# #     if not created:
-# #         try:
-# #             async_to_sync(TradeSignalHandler.debounce_send)(instance, "index", IndexAndCommoditySeraializer)
-# #         except Exception as e:
-# #             logger.error(f"Failed to notify index/commodity trade update for trade {instance.id}: {str(e)}")
+def handle_trade_update(sender, instance, created, **kwargs):
+    """Handle trade updates and broadcast to relevant users."""
+    try:
+        action = "created" if created else "updated"
+        TradeSignalHandler.broadcast_trade_update(instance, action)
+        TradeSignalHandler.create_trade_notification(instance, action)
+        
+        # Clear relevant caches
+        cache_key = TradeUpdateManager.get_cache_key(instance.user.id, instance.plan_type)
+        cache.delete(cache_key)
+        
+    except Exception as e:
+        logger.error(f"Error handling trade update signal: {str(e)}")

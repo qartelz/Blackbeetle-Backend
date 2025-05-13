@@ -6,6 +6,7 @@ from django.core.exceptions import ValidationError
 from decimal import Decimal
 from django.db import transaction
 from model_utils import FieldTracker
+from django.utils.log import logger
 User = get_user_model()
 
 
@@ -231,11 +232,25 @@ class Trade(models.Model):
                 )
 
     def save(self, *args, **kwargs):
+        """Override save to handle trade status changes and notifications."""
+        is_new = self.pk is None
+        old_status = None
+        
+        if not is_new:
+            old_instance = Trade.objects.get(pk=self.pk)
+            old_status = old_instance.status
+
         self.clean()  # Run validation before saving
-        from datetime import datetime
+        
         if self.status in [self.Status.COMPLETED, self.Status.CANCELLED]:
             self.completed_at = timezone.now()
+            
         super().save(*args, **kwargs)
+        
+        # Handle status changes and notifications
+        if not is_new and old_status != self.status:
+            from django.db.models.signals import post_save
+            post_save.send(sender=self.__class__, instance=self, created=False)
 
     @classmethod
     def get_available_trade_types(cls, company_token_id):
@@ -280,33 +295,39 @@ class Trade(models.Model):
         Returns appropriate number of previous and new trades.
         """
         if not subscription or not subscription.is_active:
+            logger.warning(f"No active subscription found for user {user.id}")
             return cls.objects.none()
 
         subscription_date = subscription.start_date
         now = timezone.now()
+        logger.info(f"Getting trades for user {user.id} with {subscription.plan.name} subscription")
+
+        # Get allowed plan types based on subscription
+        allowed_plan_types = cls._get_allowed_plan_types(subscription.plan.name)
+        logger.info(f"Allowed plan types for {subscription.plan.name}: {allowed_plan_types}")
+
+        # Base query for all trades
+        base_query = cls.objects.filter(
+            plan_type__in=allowed_plan_types,
+            created_at__lte=now
+        ).select_related('company', 'analysis')
 
         # Get active trades
-        active_trades = cls.objects.filter(
-            status=cls.Status.ACTIVE,
-            plan_type__in=cls._get_allowed_plan_types(subscription.plan.name)
+        active_trades = base_query.filter(
+            status=cls.Status.ACTIVE
         ).order_by('-created_at')
 
         # Get completed trades after subscription
-        completed_trades = cls.objects.filter(
+        completed_trades = base_query.filter(
             status=cls.Status.COMPLETED,
-            completed_at__gte=subscription_date,
-            plan_type__in=cls._get_allowed_plan_types(subscription.plan.name)
+            completed_at__gte=subscription_date
         ).order_by('-created_at')
 
         # Get previous trades (before subscription)
-        previous_trades = cls.objects.filter(
+        previous_trades = base_query.filter(
             created_at__lt=subscription_date,
-            status__in=[cls.Status.COMPLETED, cls.Status.CANCELLED],
-            plan_type__in=cls._get_allowed_plan_types(subscription.plan.name)
+            status__in=[cls.Status.COMPLETED, cls.Status.CANCELLED]
         ).order_by('-created_at')
-
-        # Combine all trades
-        all_trades = (active_trades | completed_trades | previous_trades).distinct()
 
         # Apply subscription-based limits
         if subscription.plan.name == 'BASIC':
@@ -314,25 +335,21 @@ class Trade(models.Model):
             previous = previous_trades[:6]
             # Get 6 newest trades (active or completed after subscription)
             newest = (active_trades | completed_trades).distinct().order_by('-created_at')[:6]
-            return (previous | newest).distinct().order_by('-created_at')
+            result = (previous | newest).distinct().order_by('-created_at')
+            logger.info(f"BASIC plan: returning {result.count()} trades")
+            return result
         elif subscription.plan.name == 'PREMIUM':
             # Get 6 previous trades
             previous = previous_trades[:6]
             # Get 9 newest trades
             newest = (active_trades | completed_trades).distinct().order_by('-created_at')[:9]
-            return (previous | newest).distinct().order_by('-created_at')
+            result = (previous | newest).distinct().order_by('-created_at')
+            logger.info(f"PREMIUM plan: returning {result.count()} trades")
+            return result
         else:  # SUPER_PREMIUM or FREE_TRIAL
-            return all_trades.order_by('-created_at')
-
-    @staticmethod
-    def _get_allowed_plan_types(subscription_plan):
-        """Get allowed plan types based on subscription level."""
-        if subscription_plan == 'BASIC':
-            return [Trade.PlanType.BASIC]
-        elif subscription_plan == 'PREMIUM':
-            return [Trade.PlanType.BASIC, Trade.PlanType.PREMIUM]
-        else:  # SUPER_PREMIUM or FREE_TRIAL
-            return [Trade.PlanType.BASIC, Trade.PlanType.PREMIUM, Trade.PlanType.SUPER_PREMIUM]
+            result = (active_trades | completed_trades | previous_trades).distinct().order_by('-created_at')
+            logger.info(f"SUPER_PREMIUM plan: returning {result.count()} trades")
+            return result
 
     @property
     def is_accessible_to_user(self, user):
