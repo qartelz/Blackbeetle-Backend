@@ -80,11 +80,26 @@ class TradeViewSet(viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         """Create trade with analysis"""
         try:
+            # First validate the data
             serializer = self.get_serializer(data=request.data)
             serializer.is_valid(raise_exception=True)
             
-            # Create trade within the transaction
+            # Create the trade
             trade = serializer.save(user=request.user)
+            
+            # Create initial notification if needed
+            try:
+                from ..models import TradeNotification
+                TradeNotification.create_trade_notification(
+                    user=request.user,
+                    trade=trade,
+                    notification_type=TradeNotification.NotificationType.TRADE_ACTIVATED,
+                    message=f"New {trade.trade_type.lower()} trade created for {trade.company.trading_symbol}",
+                    priority=TradeNotification.Priority.HIGH
+                )
+            except Exception as e:
+                logger.error(f"Error creating initial notification: {str(e)}")
+                # Don't raise the error - we still want to return the created trade
             
             return Response(
                 TradeSerializer(trade).data,
@@ -92,20 +107,19 @@ class TradeViewSet(viewsets.ModelViewSet):
             )
             
         except DjangoValidationError as e:
-            # Django validation errors will automatically roll back the transaction
+            logger.error(f"Django validation error: {str(e)}")
             return Response(
                 {'error': e.messages if hasattr(e, 'messages') else [str(e)]},
                 status=status.HTTP_400_BAD_REQUEST
             )
         except DRFValidationError as e:
-            # DRF validation errors will automatically roll back the transaction
+            logger.error(f"DRF validation error: {str(e)}")
             return Response(
                 {'error': e.detail if hasattr(e, 'detail') else str(e)},
                 status=status.HTTP_400_BAD_REQUEST
             )
         except Exception as e:
-            # Any other errors will automatically roll back the transaction
-            logger.error(f"Error creating trade: {str(e)}")
+            logger.error(f"Unexpected error creating trade: {str(e)}")
             return Response(
                 {'error': f'An unexpected error occurred: {str(e)}'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR

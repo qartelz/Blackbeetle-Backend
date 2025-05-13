@@ -201,6 +201,11 @@ class Trade(models.Model):
         help_text="When the trade was completed or cancelled"
     )
 
+    @property
+    def is_stock_trade(self):
+        """Check if this is a stock trade (not an index/commodity trade)."""
+        return self.company.instrument_type == InstrumentType.EQUITY
+
     class Meta:
         indexes = [
             models.Index(fields=['status', 'trade_type', 'plan_type']),
