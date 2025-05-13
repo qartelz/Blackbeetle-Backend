@@ -18,7 +18,7 @@ combined_websocket_patterns = trade_websocket_urlpatterns + notification_websock
 # Define the application
 application = ProtocolTypeRouter({
     "http": get_asgi_application(),
-    "websocket": AuthMiddlewareStack(
+    "websocket": JWTAuthMiddleware(
         URLRouter(
             combined_websocket_patterns
         )

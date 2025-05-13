@@ -31,7 +31,8 @@ class JWTAuthMiddleware(BaseMiddleware):
         query_string = scope.get('query_string', b'').decode()
         try:
             parsed_qs = parse_qs(query_string)
-            tokens = parsed_qs.get('access_token', [])
+            # Try both access_token and token parameters
+            tokens = parsed_qs.get('access_token', []) or parsed_qs.get('token', [])
             return tokens[0] if tokens else None
         except Exception:
             return None

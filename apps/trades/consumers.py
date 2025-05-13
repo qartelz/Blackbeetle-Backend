@@ -110,7 +110,28 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             return
 
         try:
-            if not await self._authenticate():
+            # Try to get token from URL parameters first
+            token = self.scope['url_route']['kwargs'].get('token')
+            
+            # If not in URL, try query parameters
+            if not token:
+                query_string = self.scope.get('query_string', b'').decode('utf-8')
+                parsed_qs = parse_qs(query_string)
+                token = parsed_qs.get('token', [None])[0] or parsed_qs.get('access_token', [None])[0]
+
+            if not token:
+                await self.send_error(4001)
+                await self.close(code=4001)
+                return
+
+            # Authenticate using the token
+            jwt_auth = JWTAuthentication()
+            validated_token = await sync_to_async(jwt_auth.get_validated_token)(token)
+            self.user = await sync_to_async(jwt_auth.get_user)(validated_token)
+
+            if not self.user or not self.user.is_authenticated:
+                await self.send_error(4003)
+                await self.close(code=4003)
                 return
 
             self.is_connected = True
@@ -243,6 +264,9 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                     now = timezone.now()
                     plan_name = self.subscription.plan.name
 
+                    logger.info(f"User {self.user.id} subscription started at: {subscription_date}")
+                    logger.info(f"Current time: {now}")
+
                     # Base query for all trades
                     base_query = Trade.objects.filter(
                         created_at__lte=now
@@ -255,45 +279,50 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
 
                     # Get new trades (created after subscription)
                     new_trades = base_query.filter(
-                        created_at__gte=subscription_date
+                        created_at__gte=subscription_date,
+                        status=Trade.Status.ACTIVE  # Only active trades
                     ).order_by('-created_at')
 
                     # Get previous trades (before subscription)
                     previous_trades = base_query.filter(
                         created_at__lt=subscription_date,
-                        status__in=[Trade.Status.COMPLETED, Trade.Status.CANCELLED]
+                        status=Trade.Status.ACTIVE  # Only active trades
                     ).order_by('-created_at')
+
+                    # Log trade times for debugging
+                    for trade in previous_trades:
+                        logger.info(f"Previous trade {trade.id} created at: {trade.created_at}")
+                    for trade in new_trades:
+                        logger.info(f"New trade {trade.id} created at: {trade.created_at}")
 
                     # Apply subscription-based limits
                     if plan_name == 'BASIC':
-                        # Get 6 previous trades
+                        # Get exactly 6 previous active trades
                         previous = list(previous_trades[:6])
-                        # Get exactly 6 newest trades
+                        # Get exactly 6 newest active trades
                         newest = list(new_trades[:6])
                         # Combine both lists
                         result = previous + newest
                         logger.info(f"BASIC user {self.user.id}: {len(previous)} previous trades, {len(newest)} new trades, total: {len(result)}")
-                        
-                        # If no trades found, try to get any available trades
-                        if not result:
-                            result = list(base_query.order_by('-created_at')[:6])
-                            logger.info(f"No specific trades found for BASIC user {self.user.id}, getting latest 6 trades instead")
+                        logger.info(f"Previous trades: {[t.id for t in previous]}")
+                        logger.info(f"New trades: {[t.id for t in newest]}")
                     elif plan_name == 'PREMIUM':
-                        # Get 6 previous trades
+                        # Get exactly 6 previous active trades
                         previous = list(previous_trades[:6])
-                        # Get exactly 9 newest trades
+                        # Get exactly 9 newest active trades
                         newest = list(new_trades[:9])
                         # Combine both lists
                         result = previous + newest
                         logger.info(f"PREMIUM user {self.user.id}: {len(previous)} previous trades, {len(newest)} new trades, total: {len(result)}")
-                        
-                        # If no trades found, try to get any available trades
-                        if not result:
-                            result = list(base_query.order_by('-created_at')[:9])
-                            logger.info(f"No specific trades found for PREMIUM user {self.user.id}, getting latest 9 trades instead")
+                        logger.info(f"Previous trades: {[t.id for t in previous]}")
+                        logger.info(f"New trades: {[t.id for t in newest]}")
                     else:  # SUPER_PREMIUM or FREE_TRIAL
-                        result = list(new_trades) + list(previous_trades)
-                        logger.info(f"{plan_name} user {self.user.id}: all trades, total: {len(result)}")
+                        # Get only active trades
+                        result = list(base_query.filter(
+                            status=Trade.Status.ACTIVE
+                        ).order_by('-created_at'))
+                        logger.info(f"{plan_name} user {self.user.id}: all active trades, total: {len(result)}")
+                        logger.info(f"Active trades: {[t.id for t in result]}")
 
                     def format_trade(trade):
                         if not trade:
@@ -322,7 +351,9 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                                     "sl": str(history.sl),
                                     "timestamp": history.timestamp.isoformat()
                                 } for history in trade.history.all()
-                            ]
+                            ],
+                            "created_at": trade.created_at.isoformat(),
+                            "updated_at": trade.updated_at.isoformat()
                         }
 
                     def format_company(company):

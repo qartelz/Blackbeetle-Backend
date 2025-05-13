@@ -98,7 +98,7 @@ class TradeUpdateManager:
 
 class TradeSignalHandler:
     """Handles trade-related signals and broadcasts updates."""
-    
+
     @staticmethod
     def broadcast_trade_update(trade: Trade, action: str = "updated"):
         """Broadcast trade update to relevant subscribers."""
@@ -185,7 +185,6 @@ class TradeSignalHandler:
                         continue
                 
                 logger.info(f"Created notifications for trade {trade.id}")
-                
         except Exception as e:
             logger.error(f"Error creating trade notifications: {str(e)}")
 

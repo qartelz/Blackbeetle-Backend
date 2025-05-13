@@ -278,41 +278,41 @@ class PlanSerializer(serializers.ModelSerializer):
         fields = ['name']
 
 
-class UserProfileSerializer(serializers.ModelSerializer):
-    subscriptions = serializers.SerializerMethodField()
-    full_name = serializers.SerializerMethodField()
+# class UserProfileSerializer(serializers.ModelSerializer):
+#     subscriptions = serializers.SerializerMethodField()
+#     full_name = serializers.SerializerMethodField()
    
 
-    class Meta:
-        model = User
-        fields = [
-            'profile_picture',
-            'full_name',
-            'phone_number',
-            'email',
-            'city',
-            'country',
-            'subscriptions',
-        ]
+#     class Meta:
+#         model = User
+#         fields = [
+#             'profile_picture',
+#             'full_name',
+#             'phone_number',
+#             'email',
+#             'city',
+#             'country',
+#             'subscriptions',
+#         ]
 
-    def get_full_name(self, obj):
-        return obj.get_full_name()
+#     def get_full_name(self, obj):
+#         return obj.get_full_name()
 
-    def get_subscriptions(self, obj):
-        now = timezone.now().date()
-        last_expired = (
-            Subscription.objects
-            .filter(user=obj, end_date__lt=now)
-            .order_by('-end_date')
-            .first()
-        )
-        if not last_expired:
-            return []
+#     def get_subscriptions(self, obj):
+#         now = timezone.now().date()
+#         last_expired = (
+#             Subscription.objects
+#             .filter(user=obj, end_date__lt=now)
+#             .order_by('-end_date')
+#             .first()
+#         )
+#         if not last_expired:
+#             return []
 
-        return [{
-            "plan": PlanSerializer(last_expired.plan).data,
-            "order": last_expired.order.id,
-            "start_date": last_expired.start_date,
-            "end_date": last_expired.end_date,
-            "is_active": last_expired.is_active,
-        }]
+#         return [{
+#             "plan": PlanSerializer(last_expired.plan).data,
+#             "order": last_expired.order.id,
+#             "start_date": last_expired.start_date,
+#             "end_date": last_expired.end_date,
+#             "is_active": last_expired.is_active,
+#         }]

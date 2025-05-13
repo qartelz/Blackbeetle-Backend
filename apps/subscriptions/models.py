@@ -191,16 +191,14 @@ class Order(BaseModel):
         """
         Creates a new subscription or extends existing one
         """
-        today = timezone.now().date()
-        print("-sdsdsds-ds-------------sdsdsds-------------------------dsds---------------")
+        now = timezone.now()
         
         with transaction.atomic():
             active_sub = Subscription.objects.filter(
                 user=self.user,
                 is_active=True,
-                end_date__gt=today
+                end_date__gt=now
             ).select_for_update().first()
-            print(active_sub,'----------------active_sub------------------')
 
             if active_sub and active_sub.plan == self.plan:
                 # Extend existing subscription
@@ -211,14 +209,14 @@ class Order(BaseModel):
                 # Deactivate old subscription if different plan
                 active_sub.is_active = False
                 active_sub.save()
-            print('+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++')
-            # Create new subscription
+
+            # Create new subscription with current date and time
             return Subscription.objects.create(
                 user=self.user,
                 plan=self.plan,
                 order=self,
-                start_date=today,
-                end_date=today + timedelta(days=self.plan.duration_days),
+                start_date=now,  # Use current datetime
+                end_date=now + timedelta(days=self.plan.duration_days),  # Use current datetime
                 is_active=True
             )
 
@@ -258,14 +256,13 @@ class Subscription(BaseModel):
         on_delete=models.PROTECT,
         related_name='subscriptions'
     )
-    start_date = models.DateField() #
-    end_date = models.DateField()
+    start_date = models.DateTimeField()  # Changed from DateField to DateTimeField
+    end_date = models.DateTimeField()    # Changed from DateField to DateTimeField
     is_active = models.BooleanField(default=True)
     auto_renew = models.BooleanField(default=False)
     cancelled_at = models.DateTimeField(
         null=True,
-        blank=True,
-        help_text="When the subscription was cancelled"
+        blank=True
     )
 
     def clean(self):
@@ -277,11 +274,11 @@ class Subscription(BaseModel):
         """
         Check if subscription is currently valid
         """
-        today = timezone.now().date()
+        now = timezone.now()
         return (
             self.is_active and
             not self.cancelled_at and
-            self.start_date <= today <= self.end_date
+            self.start_date <= now <= self.end_date
         )
 
     def get_remaining_days(self):
@@ -290,10 +287,10 @@ class Subscription(BaseModel):
         """
         if not self.is_valid():
             return 0
-        today = timezone.now().date()  # Added local today variable
-        if today > self.end_date:
+        now = timezone.now()
+        if now > self.end_date:
             return 0
-        return (self.end_date - today).days
+        return (self.end_date - now).days
 
     def cancel(self):
         """
