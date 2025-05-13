@@ -6,6 +6,7 @@ from asgiref.sync import async_to_sync
 import logging
 from typing import Dict, List
 from django.db import transaction
+from datetime import timedelta
 
 from .models import Trade, TradeNotification
 from apps.subscriptions.models import Subscription
@@ -65,20 +66,28 @@ class TradeUpdateManager:
                 # Create group names for each user
                 groups = []
                 for sub in subscriptions:
-                    # Check if user has reached their trade limit
-                    if sub.plan.name in ['BASIC', 'PREMIUM']:
-                        # Count trades created after subscription start
-                        trade_count = Trade.objects.filter(
+                    if sub.plan.name == 'BASIC':
+                        # Count new trades after subscription
+                        new_trades_count = Trade.objects.filter(
                             created_at__gte=sub.start_date,
                             created_at__lte=timezone.now()
                         ).count()
                         
-                        # Only add to groups if within limit
-                        if (sub.plan.name == 'BASIC' and trade_count <= 6) or \
-                           (sub.plan.name == 'PREMIUM' and trade_count <= 9):
+                        # Only add to groups if within new trade limit (6)
+                        if new_trades_count <= 6:
                             groups.append(f"trade_updates_{sub.user.id}")
-                    else:
-                        # SUPER_PREMIUM and FREE_TRIAL users get all updates
+                    elif sub.plan.name == 'PREMIUM':
+                        # Count new trades after subscription
+                        new_trades_count = Trade.objects.filter(
+                            created_at__gte=sub.start_date,
+                            created_at__lte=timezone.now()
+                        ).count()
+                        
+                        # Only add to groups if within new trade limit (9)
+                        if new_trades_count <= 9:
+                            groups.append(f"trade_updates_{sub.user.id}")
+                    else:  # SUPER_PREMIUM or FREE_TRIAL
+                        # No limits for these plans
                         groups.append(f"trade_updates_{sub.user.id}")
 
                 return groups
@@ -130,16 +139,15 @@ class TradeSignalHandler:
                 
                 for subscription in subscriptions:
                     try:
-                        # Check if user has reached their trade limit
-                        if subscription.plan.name in ['BASIC', 'PREMIUM']:
-                            trade_count = Trade.objects.filter(
+                        if subscription.plan.name == 'BASIC':
+                            # Count new trades after subscription
+                            new_trades_count = Trade.objects.filter(
                                 created_at__gte=subscription.start_date,
                                 created_at__lte=timezone.now()
                             ).count()
                             
-                            # Only create notification if within limit
-                            if (subscription.plan.name == 'BASIC' and trade_count <= 6) or \
-                               (subscription.plan.name == 'PREMIUM' and trade_count <= 9):
+                            # Only create notification if within new trade limit (6)
+                            if new_trades_count <= 6:
                                 TradeNotification.create_trade_notification(
                                     user=subscription.user,
                                     trade=trade,
@@ -147,8 +155,24 @@ class TradeSignalHandler:
                                     message=f"Trade update for {trade.company.trading_symbol}: {action}",
                                     priority=TradeNotification.Priority.HIGH if trade.status == Trade.Status.ACTIVE else TradeNotification.Priority.NORMAL
                                 )
-                        else:
-                            # SUPER_PREMIUM and FREE_TRIAL users get all notifications
+                        elif subscription.plan.name == 'PREMIUM':
+                            # Count new trades after subscription
+                            new_trades_count = Trade.objects.filter(
+                                created_at__gte=subscription.start_date,
+                                created_at__lte=timezone.now()
+                            ).count()
+                            
+                            # Only create notification if within new trade limit (9)
+                            if new_trades_count <= 9:
+                                TradeNotification.create_trade_notification(
+                                    user=subscription.user,
+                                    trade=trade,
+                                    notification_type=TradeNotification.NotificationType.TRADE_UPDATE,
+                                    message=f"Trade update for {trade.company.trading_symbol}: {action}",
+                                    priority=TradeNotification.Priority.HIGH if trade.status == Trade.Status.ACTIVE else TradeNotification.Priority.NORMAL
+                                )
+                        else:  # SUPER_PREMIUM or FREE_TRIAL
+                            # No limits for these plans
                             TradeNotification.create_trade_notification(
                                 user=subscription.user,
                                 trade=trade,

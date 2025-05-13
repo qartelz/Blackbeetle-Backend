@@ -268,13 +268,13 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                     if plan_name == 'BASIC':
                         # Get 6 previous trades
                         previous = previous_trades[:6]
-                        # Get exactly 6 newest trades (based on creation date only)
+                        # Get exactly 6 newest trades
                         newest = new_trades[:6]
                         result = (previous | newest).distinct().order_by('-created_at')
                     elif plan_name == 'PREMIUM':
                         # Get 6 previous trades
                         previous = previous_trades[:6]
-                        # Get exactly 9 newest trades (based on creation date only)
+                        # Get exactly 9 newest trades
                         newest = new_trades[:9]
                         result = (previous | newest).distinct().order_by('-created_at')
                     else:  # SUPER_PREMIUM or FREE_TRIAL
