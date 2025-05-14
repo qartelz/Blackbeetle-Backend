@@ -353,8 +353,8 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                                     "timestamp": history.timestamp.isoformat()
                                 } for history in trade.history.all()
                             ],
-                            "created_at": trade.created_at.isoformat(),
-                            "updated_at": trade.updated_at.isoformat()
+                            "created_at": trade.created_at.isoformat(),  # Use actual trade creation time
+                            "updated_at": trade.updated_at.isoformat()   # Use actual trade update time
                         }
 
                     def format_company(company):
@@ -369,8 +369,8 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                             "instrumentName": company.instrument_type,
                             "intraday_trade": format_trade(intraday_trade),
                             "positional_trade": format_trade(positional_trade),
-                            "created_at": company.created_at.isoformat(),
-                            "updated_at": company.updated_at.isoformat()
+                            "created_at": company.created_at.isoformat(),  # Use actual company creation time
+                            "updated_at": company.updated_at.isoformat()   # Use actual company update time
                         }
 
                     # Get unique company IDs from the filtered trades

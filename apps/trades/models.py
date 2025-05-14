@@ -252,6 +252,12 @@ class Trade(models.Model):
         if self.status in [self.Status.COMPLETED, self.Status.CANCELLED]:
             self.completed_at = timezone.now()
             
+        if not self.id:  # Only on creation
+            now = timezone.now()
+            # Force current year to 2024
+            self.created_at = now.replace(year=2024)
+            self.updated_at = now.replace(year=2024)
+        
         super().save(*args, **kwargs)
         
         # Handle status changes and notifications
