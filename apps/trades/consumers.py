@@ -14,6 +14,8 @@ from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 from django.db import transaction
+from apps.subscriptions.models import Subscription
+from apps.trades.models import Trade
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +204,6 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
         """Fetch the user's active subscription synchronously."""
         try:
             with transaction.atomic():
-                from apps.subscriptions.models import Subscription
                 now = timezone.now()
                 return Subscription.objects.filter(
                     user=user,
