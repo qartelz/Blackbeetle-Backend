@@ -364,7 +364,6 @@ class Trade(models.Model):
             logger.info(f"SUPER_PREMIUM plan: returning {result.count()} trades")
             return result
 
-    @property
     def is_accessible_to_user(self, user):
         """
         Check if a trade is accessible to a user based on their subscription.
