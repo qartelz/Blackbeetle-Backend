@@ -121,35 +121,11 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             return
 
         try:
-<<<<<<< HEAD
-            # Try to get token from URL parameters first
-            token = self.scope['url_route']['kwargs'].get('token')
-            
-            # If not in URL, try query parameters
-            if not token:
-                query_string = self.scope.get('query_string', b'').decode('utf-8')
-                parsed_qs = parse_qs(query_string)
-                token = parsed_qs.get('token', [None])[0] or parsed_qs.get('access_token', [None])[0]
-
-            if not token:
-                await self.send_error(4001)
-                await self.close(code=4001)
-                return
-
-            # Authenticate using the token
-            jwt_auth = JWTAuthentication()
-            validated_token = await sync_to_async(jwt_auth.get_validated_token)(token)
-            self.user = await sync_to_async(jwt_auth.get_user)(validated_token)
-
-            if not self.user or not self.user.is_authenticated:
-                await self.send_error(4003)
-=======
             # Accept the connection first
             await self.accept()
             
             # Then authenticate
             if not await self._authenticate():
->>>>>>> e5d635f (best possble output updated)
                 await self.close(code=4003)
                 return
 
@@ -190,13 +166,20 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
     async def _authenticate(self) -> bool:
         """Authenticate the user using a JWT token."""
         try:
-            query_string = self.scope.get('query_string', b'').decode('utf-8')
-            token = parse_qs(query_string).get('token', [None])[0]
+            # Try to get token from URL parameters first
+            token = self.scope['url_route']['kwargs'].get('token')
+            
+            # If not in URL, try query parameters
+            if not token:
+                query_string = self.scope.get('query_string', b'').decode('utf-8')
+                parsed_qs = parse_qs(query_string)
+                token = parsed_qs.get('token', [None])[0] or parsed_qs.get('access_token', [None])[0]
 
             if not token:
                 await self.send_error(4001)
                 return False
 
+            # Authenticate using the token
             jwt_auth = JWTAuthentication()
             validated_token = await sync_to_async(jwt_auth.get_validated_token)(token)
             self.user = await sync_to_async(jwt_auth.get_user)(validated_token)
@@ -301,139 +284,6 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
         from django.db.models import Prefetch
         
         try:
-<<<<<<< HEAD
-            if not self.subscription or not self.subscription.plan:
-                logger.warning("No subscription or plan found")
-                return {'stock_data': [], 'index_data': []}
-
-            @db_sync_to_async
-            def fetch_data():
-                with transaction.atomic():
-                    from .models import Company, Trade
-                    from apps.indexAndCommodity.models import IndexAndCommodity
-
-                    subscription_date = self.subscription.start_date
-                    now = timezone.now()
-                    plan_name = self.subscription.plan.name
-
-                    logger.info(f"User {self.user.id} subscription started at: {subscription_date}")
-                    logger.info(f"Current time: {now}")
-
-                    # Base query for all trades
-                    base_query = Trade.objects.filter(
-                        created_at__lte=now
-                    ).select_related(
-                        'company',
-                        'analysis'
-                    ).prefetch_related(
-                        'history'
-                    )
-
-                    # Get new trades (created after subscription)
-                    new_trades = base_query.filter(
-                        created_at__gte=subscription_date,
-                        status=Trade.Status.ACTIVE  # Only active trades
-                    ).order_by('-created_at')
-
-                    # Get previous trades (before subscription)
-                    previous_trades = base_query.filter(
-                        created_at__lt=subscription_date,
-                        status=Trade.Status.ACTIVE  # Only active trades
-                    ).order_by('-created_at')
-
-                    # Log trade times for debugging
-                    for trade in previous_trades:
-                        logger.info(f"Previous trade {trade.id} created at: {trade.created_at}")
-                    for trade in new_trades:
-                        logger.info(f"New trade {trade.id} created at: {trade.created_at}")
-
-                    # Apply subscription-based limits
-                    if plan_name == 'BASIC':
-                        # Get exactly 6 previous active trades
-                        previous = list(previous_trades[:6])
-                        # Get exactly 6 newest active trades
-                        newest = list(new_trades[:6])
-                        # Combine both lists
-                        result = previous + newest
-                        logger.info(f"BASIC user {self.user.id}: {len(previous)} previous trades, {len(newest)} new trades, total: {len(result)}")
-                        logger.info(f"Previous trades: {[t.id for t in previous]}")
-                        logger.info(f"New trades: {[t.id for t in newest]}")
-                    elif plan_name == 'PREMIUM':
-                        # Get exactly 6 previous active trades
-                        previous = list(previous_trades[:6])
-                        # Get exactly 9 newest active trades
-                        newest = list(new_trades[:9])
-                        # Combine both lists
-                        result = previous + newest
-                        logger.info(f"PREMIUM user {self.user.id}: {len(previous)} previous trades, {len(newest)} new trades, total: {len(result)}")
-                        logger.info(f"Previous trades: {[t.id for t in previous]}")
-                        logger.info(f"New trades: {[t.id for t in newest]}")
-                    else:  # SUPER_PREMIUM or FREE_TRIAL
-                        # Get only active trades
-                        result = list(base_query.filter(
-                            status=Trade.Status.ACTIVE
-                        ).order_by('-created_at'))
-                        logger.info(f"{plan_name} user {self.user.id}: all active trades, total: {len(result)}")
-                        logger.info(f"Active trades: {[t.id for t in result]}")
-
-                    def format_trade(trade):
-                        if not trade:
-                            return None
-                        
-                        return {
-                            "id": trade.id,
-                            "trade_type": trade.trade_type,
-                            "status": trade.status,
-                            "plan_type": trade.plan_type,
-                            "warzone": str(trade.warzone),
-                            "image": trade.image.url if trade.image else None,
-                            "warzone_history": trade.warzone_history or [],
-                            "analysis": {
-                                "bull_scenario": trade.analysis.bull_scenario if hasattr(trade, 'analysis') else None,
-                                "bear_scenario": trade.analysis.bear_scenario if hasattr(trade, 'analysis') else None,
-                                "status": trade.analysis.status if hasattr(trade, 'analysis') else None,
-                                "completed_at": trade.analysis.completed_at.isoformat() if hasattr(trade, 'analysis') and trade.analysis.completed_at else None,
-                                "created_at": trade.analysis.created_at.isoformat() if hasattr(trade, 'analysis') else None,
-                                "updated_at": trade.analysis.updated_at.isoformat() if hasattr(trade, 'analysis') else None
-                            } if hasattr(trade, 'analysis') else None,
-                            "trade_history": [
-                                {
-                                    "buy": str(history.buy),
-                                    "target": str(history.target),
-                                    "sl": str(history.sl),
-                                    "timestamp": history.timestamp.isoformat()
-                                } for history in trade.history.all()
-                            ],
-                            "created_at": trade.created_at.isoformat(),  # Use actual trade creation time
-                            "updated_at": trade.updated_at.isoformat()   # Use actual trade update time
-                        }
-
-                    def format_company(company):
-                        trades = company.trades.filter(status=Trade.Status.ACTIVE)
-                        intraday_trade = trades.filter(trade_type=Trade.TradeType.INTRADAY).first()
-                        positional_trade = trades.filter(trade_type=Trade.TradeType.POSITIONAL).first()
-
-                        return {
-                            "id": company.id,
-                            "tradingSymbol": company.trading_symbol,
-                            "exchange": company.exchange,
-                            "instrumentName": company.instrument_type,
-                            "intraday_trade": format_trade(intraday_trade),
-                            "positional_trade": format_trade(positional_trade),
-                            "created_at": company.created_at.isoformat(),  # Use actual company creation time
-                            "updated_at": company.updated_at.isoformat()   # Use actual company update time
-                        }
-
-                    # Get unique company IDs from the filtered trades
-                    company_ids = set(trade.company_id for trade in result)
-                    companies = Company.objects.filter(id__in=company_ids)
-                    
-                    company_items = [format_company(company) for company in companies]
-                    return {'stock_data': company_items, 'index_data': []}
-
-            return await fetch_data()
-            
-=======
             with transaction.atomic():
                 logger.info(f"Getting filtered company data for user {self.user.id}")
                 
@@ -552,7 +402,6 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                     'index_data': []  # Include empty index_data as in your example
                 }
                 
->>>>>>> e5d635f (best possble output updated)
         except Exception as e:
             logger.error(f"Error getting filtered company data: {str(e)}")
             import traceback
@@ -841,6 +690,8 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             import traceback
             logger.error(traceback.format_exc())
             return False
+
+
 
 
 # from channels.generic.websocket import AsyncWebsocketConsumer
