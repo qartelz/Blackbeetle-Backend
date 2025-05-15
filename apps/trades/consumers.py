@@ -13,6 +13,7 @@ from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from django.db import transaction
 from apps.subscriptions.models import Subscription
 from apps.trades.models import Trade
+from django.db import models
 
 logger = logging.getLogger(__name__)
 
@@ -835,33 +836,39 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
         """Synchronous version of _get_trade_counts for use within sync methods."""
         try:
             from apps.trades.models import Trade
+            from django.db import models
             
             # Get plan type
             plan_name = self.subscription.plan.name
             plan_levels = self.trade_manager.get_plan_levels(plan_name)
             
-            # Get subscription start date
+            # Get subscription dates
             subscription_start = self.subscription.start_date
+            subscription_end = self.subscription.end_date
             
-            # 1. Get "previous" trades - trades that were ACTIVE at subscription start time
+            # Previous trades - Get the 6 most recent trades created before subscription
             previous_trades = Trade.objects.filter(
-                status='ACTIVE',
                 created_at__lt=subscription_start,
                 plan_type__in=plan_levels
-            ).select_related('company')
+            ).order_by('-created_at')[:6]  # Get 6 most recent
             
             # Count unique companies with previous trades
             previous_companies = set()
             for trade in previous_trades:
                 previous_companies.add(trade.company.id)
             
-            # 2. Get "new" trades - trades created AFTER subscription start time
+            # New trades - Get trades created after subscription, limited by plan
             new_trades = Trade.objects.filter(
                 created_at__gte=subscription_start,
                 plan_type__in=plan_levels
-            ).exclude(
-                status='CANCELED'  # Exclude canceled trades
-            ).select_related('company')
+            ).order_by('-created_at')
+            
+            # Apply limit based on plan type
+            if plan_name == 'BASIC':
+                new_trades = new_trades[:6]  # BASIC: 6 new trades
+            elif plan_name == 'PREMIUM':
+                new_trades = new_trades[:9]  # PREMIUM: 9 new trades
+            # SUPER_PREMIUM and FREE_TRIAL have no limits
             
             # Count unique companies with new trades
             new_companies = set()
@@ -876,6 +883,11 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             # Return counts
             new_count = len(new_companies)
             previous_count = len(previous_companies)
+            
+            logger.info(f"Trade counts for user {self.user.id}:")
+            logger.info(f"Previous trades: {previous_count} companies")
+            logger.info(f"New trades: {new_count} companies")
+            logger.info(f"Total: {new_count + previous_count} companies")
             
             return {
                 'new': new_count,
