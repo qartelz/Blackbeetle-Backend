@@ -5,6 +5,9 @@ import uuid
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 from apps.trades.models import Trade
+from datetime import timedelta
+import logging
+import traceback
 
 User = get_user_model()
 
@@ -255,4 +258,46 @@ class TradeNotification(models.Model):
             )
 
         return notification
+
+@staticmethod
+def create_trade_notification(trade: Trade, action: str = "updated"):
+    try:
+        subscriptions = Subscription.objects.filter(
+            is_active=True,
+            end_date__gt=timezone.now()
+        ).select_related('user', 'plan')
+
+        # Add a time threshold to prevent duplicates (e.g., 5 seconds)
+        recent_notification_threshold = timezone.now() - timedelta(seconds=5)
+
+        for subscription in subscriptions:
+            if TradeSignalHandler.should_send_trade_update(subscription.user, trade, subscription):
+                # Check for recent notifications for this trade and user
+                recent_notification_exists = TradeNotification.objects.filter(
+                    user=subscription.user,
+                    trade=trade,
+                    created_at__gte=recent_notification_threshold
+                ).exists()
+
+                if not recent_notification_exists:
+                    notification_type = (
+                        TradeNotification.NotificationType.TRADE_COMPLETED 
+                        if trade.status == 'COMPLETED' 
+                        else TradeNotification.NotificationType.TRADE_UPDATE
+                    )
+                    
+                    TradeNotification.create_trade_notification(
+                        user=subscription.user,
+                        trade=trade,
+                        notification_type=notification_type,
+                        message=f"Trade {'completed' if trade.status == 'COMPLETED' else 'update'} for {trade.company.trading_symbol}",
+                        priority=TradeNotification.Priority.HIGH if trade.status == 'ACTIVE' else TradeNotification.Priority.NORMAL
+                    )
+                    logger.info(f"Created notification for user {subscription.user.id} for trade {trade.id}")
+                else:
+                    logger.info(f"Skipped duplicate notification for user {subscription.user.id} for trade {trade.id}")
+
+    except Exception as e:
+        logger.error(f"Error creating trade notifications: {str(e)}")
+        logger.error(traceback.format_exc())
 
