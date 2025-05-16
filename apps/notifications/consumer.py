@@ -288,27 +288,47 @@ class BaseConsumer(AsyncWebsocketConsumer):
             "timestamp": timezone.now().isoformat()
         }, cls=CustomJSONEncoder))
 
-
 class NotificationConsumer(BaseConsumer):
     """
     WebSocket consumer for handling real-time notifications.
     """
-    
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-    
     async def _setup_user_group(self) -> bool:
-        """Set up notification group for the user"""
-        connection_id = self._connection_id
+        """Set up user's notification group"""
         try:
-            self.user_group = f"notification_updates_{self.user.id}"
-            await self.channel_layer.group_add(self.user_group, self.channel_name)
-            logger.info(f"[{connection_id}] Added to group {self.user_group}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"[{connection_id}] Error setting up user group: {str(e)}", exc_info=True)
+            if self.user:
+                # Use a distinct prefix for notification groups
+                self.user_group = f"notification_updates_{self.user.id}"
+                await self.channel_layer.group_add(
+                    self.user_group,
+                    self.channel_name
+                )
+                return True
             return False
+        except Exception as e:
+            logger.error(f"Error setting up user group: {str(e)}")
+            return False
+
+
+# class NotificationConsumer(BaseConsumer):
+#     """
+#     WebSocket consumer for handling real-time notifications.
+#     """
+    
+#     def __init__(self, *args: Any, **kwargs: Any) -> None:
+#         super().__init__(*args, **kwargs)
+    
+#     async def _setup_user_group(self) -> bool:
+#         """Set up notification group for the user"""
+#         connection_id = self._connection_id
+#         try:
+#             self.user_group = f"notification_updates_{self.user.id}"
+#             await self.channel_layer.group_add(self.user_group, self.channel_name)
+#             logger.info(f"[{connection_id}] Added to group {self.user_group}")
+#             return True
+            
+#         except Exception as e:
+#             logger.error(f"[{connection_id}] Error setting up user group: {str(e)}", exc_info=True)
+#             return False
 
     async def send_initial_data(self) -> None:
         """Send initial notification data"""

@@ -234,23 +234,22 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
     async def _setup_user_group(self) -> bool:
         """Set up the user's channel group and subscription details."""
         try:
+            # Get subscription first
             self.subscription = await self._get_active_subscription(self.user)
             if not self.subscription:
                 logger.error(f"No subscription found for user {self.user.id}")
                 await self.send_error(4005)
                 return False
 
-            # Set up user group
+            # Set up user group with distinct prefix
             self.user_group = f"trade_updates_{self.user.id}"
             
             # Add to channel group
             await self.channel_layer.group_add(self.user_group, self.channel_name)
             logger.info(f"Added user {self.user.id} to group {self.user_group}")
             
-            # Get current trade counts
+            # Get trade counts and limits
             trade_counts = await self._get_trade_counts()
-            
-            # Get plan limits based on subscription type
             plan_name = self.subscription.plan.name
             limits = self.company_limits.get(plan_name, {'new': None, 'previous': None, 'total': None})
             
