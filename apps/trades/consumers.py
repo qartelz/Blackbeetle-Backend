@@ -380,8 +380,10 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 plan_levels = self.trade_manager.get_plan_levels(plan_name)
                 
                 # Step 1: Get all companies with any active or completed trades in accessible plan levels
+                # Exclude PENDING trades
                 companies_with_trades = Company.objects.filter(
-                    trades__plan_type__in=plan_levels
+                    trades__plan_type__in=plan_levels,
+                    trades__status__in=['ACTIVE', 'COMPLETED']  # Exclude PENDING
                 ).distinct()
                 
                 # Step 2: Separate companies into "previous" and "new" collections
@@ -394,9 +396,11 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 # Process each company to categorize and format its data
                 for company in all_companies:
                     # Get all trades for this company
+                    # Exclude PENDING trades
                     company_trades = Trade.objects.filter(
                         company=company,
-                        plan_type__in=plan_levels
+                        plan_type__in=plan_levels,
+                        status__in=['ACTIVE', 'COMPLETED']  # Exclude PENDING
                     ).select_related('analysis').prefetch_related('history')
                     
                     # Check if this company had trades active at subscription start
@@ -850,9 +854,11 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             # Previous trades - Get trades created before subscription that are either:
             # 1. Still active (no completed_at)
             # 2. Completed after subscription start
+            # Exclude PENDING trades
             previous_trades = Trade.objects.filter(
                 created_at__lt=subscription_start,
-                plan_type__in=plan_levels
+                plan_type__in=plan_levels,
+                status__in=['ACTIVE', 'COMPLETED']  # Exclude PENDING
             ).filter(
                 models.Q(completed_at__isnull=True) |  # Still active
                 models.Q(completed_at__gte=subscription_start)  # Completed after subscription
@@ -864,9 +870,11 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 previous_companies.add(trade.company.id)
             
             # New trades - Get trades created after subscription, ordered by creation date
+            # Exclude PENDING trades
             new_trades = Trade.objects.filter(
                 created_at__gte=subscription_start,
-                plan_type__in=plan_levels
+                plan_type__in=plan_levels,
+                status__in=['ACTIVE', 'COMPLETED']  # Exclude PENDING
             ).order_by('created_at')  # Order by oldest first
             
             # Apply strict limit based on plan type
