@@ -49,9 +49,13 @@ class TradeUpdateManager:
     @classmethod
     def prepare_trade_data(cls, trade: Trade, action: str = "updated") -> Dict:
         try:
+            # Determine message type based on trade status
+            message_type = "trade_completed" if trade.status == 'COMPLETED' else "trade_update"
+            
             data = {
                 "trade_id": trade.id,
                 "action": action,
+                "message_type": message_type,
                 "trade_status": trade.status,
                 "plan_type": trade.plan_type,
                 "update_type": "stock" if getattr(trade, 'is_stock_trade', False) else "index",

@@ -556,7 +556,7 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
         try:
             formatted_trade = {
                     'id': trade.id,
-                'trade_type': trade.trade_type,
+                    'trade_type': trade.trade_type,
                     'status': trade.status,
                     'plan_type': trade.plan_type,
                     'warzone': str(trade.warzone),
@@ -639,6 +639,12 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             data = event["data"]
             logger.info(f"Processing trade update for trade_id: {data['trade_id']}")
             
+            # Get trade info first
+            trade_info = await self._get_trade_info(data["trade_id"])
+            if not trade_info:
+                logger.warning(f"Trade {data['trade_id']} not found")
+                return
+
             # Get current trade counts and limits
             trade_counts = await self._get_trade_counts()
             plan_name = self.subscription.plan.name
@@ -651,12 +657,6 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 'total': None if limits['total'] is None else max(0, limits['total'] - trade_counts['total'])
             }
 
-            # Get trade status and creation time
-            trade_info = await self._get_trade_info(data["trade_id"])
-            if not trade_info:
-                logger.warning(f"Trade {data['trade_id']} not found")
-                return
-
             trade_status = trade_info['status']
             trade_created_at = trade_info['created_at']
             is_new_trade = trade_created_at >= self.subscription.start_date if trade_created_at else False
@@ -667,34 +667,30 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 logger.warning(f"Company with trade {data['trade_id']} not found")
                 return
 
-            # Check eligibility based on trade status
+            # Check if this trade is in the user's accessible list
             is_eligible = False
-
-            if trade_status == 'ACTIVE':
-                if is_new_trade:
-                    # For new trades, check if user has remaining slots or already has access
-                    if (limits['new'] is None or remaining['new'] > 0 or 
-                        await self._is_company_already_accessible(updated_company['id'], is_new=True)):
-                        is_eligible = True
-                    else:
-                        logger.warning(f"User {self.user.id} has no remaining slots for new trades")
-                else:
-                    # For previous trades, check if it's in the fixed set of 6
-                    if await self._is_company_already_accessible(updated_company['id'], is_new=False):
-                        is_eligible = True
-                    else:
-                        logger.warning(f"Trade not in user's fixed set of previous trades")
+            
+            # Get the user's accessible trades
+            accessible_trades = await self._get_accessible_trades()
+            trade_id = data["trade_id"]
+            
+            # Check if the trade is in the user's accessible list
+            if trade_id in accessible_trades['previous_trades'] or trade_id in accessible_trades['new_trades']:
+                is_eligible = True
+                logger.info(f"Trade {trade_id} found in user's accessible trades")
             else:
-                # For non-ACTIVE trades, check if the trade is already accessible
-                is_eligible = await self._is_company_already_accessible(updated_company['id'], is_new=is_new_trade)
-                if not is_eligible:
-                    logger.warning(f"Trade {data['trade_id']} not accessible to user {self.user.id}")
+                logger.info(f"Trade {trade_id} not found in user's accessible trades")
 
             # Only send update if user is eligible
             if is_eligible:
+                # Determine message type based on trade status
+                message_type = data.get('message_type', 'trade_update')
+                if trade_status == 'COMPLETED':
+                    message_type = 'trade_completed'
+                
                 # Prepare response data with updated subscription info
                 response_data = {
-                    "type": "trade_update",
+                    "type": message_type,
                     "data": {
                         "updated_company": updated_company,
                         "subscription": {
@@ -708,9 +704,9 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                     }
                 }
 
-                logger.info("Sending trade update to WebSocket")
+                logger.info(f"Sending {message_type} to WebSocket")
                 await self.send(text_data=json.dumps(response_data, cls=DecimalEncoder))
-                logger.info("Trade update sent successfully")
+                logger.info(f"{message_type} sent successfully")
             else:
                 logger.info(f"Silently ignoring trade update for ineligible user {self.user.id}")
 
@@ -1097,6 +1093,51 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             import traceback
             logger.error(traceback.format_exc())
             return False
+
+    @db_sync_to_async
+    def _get_accessible_trades(self):
+        """Get the list of trade IDs that this user has access to."""
+        try:
+            from apps.trades.models import Trade
+            
+            # Get subscription details
+            subscription_start = self.subscription.start_date
+            plan_name = self.subscription.plan.name
+            plan_levels = self.trade_manager.get_plan_levels(plan_name)
+            
+            # Get previous trades (fixed set of 6)
+            previous_trades = Trade.objects.filter(
+                created_at__lt=subscription_start,
+                plan_type__in=plan_levels,
+                status__in=['ACTIVE', 'COMPLETED']
+            ).order_by('-created_at')[:6].values_list('id', flat=True)
+            
+            # Get new trades based on plan limits
+            new_trades_query = Trade.objects.filter(
+                created_at__gte=subscription_start,
+                plan_type__in=plan_levels,
+                status__in=['ACTIVE', 'COMPLETED']
+            ).order_by('created_at')
+            
+            # Apply plan-specific limits
+            if plan_name == 'BASIC':
+                new_trades = new_trades_query[:6]
+            elif plan_name == 'PREMIUM':
+                new_trades = new_trades_query[:9]
+            else:  # SUPER_PREMIUM or FREE_TRIAL
+                new_trades = new_trades_query.all()
+            
+            new_trade_ids = list(new_trades.values_list('id', flat=True))
+            
+            return {
+                'previous_trades': list(previous_trades),
+                'new_trades': new_trade_ids
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting accessible trades: {str(e)}")
+            logger.error(traceback.format_exc())
+            return {'previous_trades': [], 'new_trades': []}
 
 
 class IndexUpdateManager:

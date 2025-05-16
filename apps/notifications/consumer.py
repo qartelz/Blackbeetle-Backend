@@ -317,7 +317,11 @@ class NotificationConsumer(BaseConsumer):
             if not self.is_connected:
                 return
                 
+            # Get user's unread notifications
+            notifications = await self._get_unread_notifications()
+            
             data = {
+                'notifications': notifications,
                 'user_group': self.user_group,
                 'connected_at': timezone.now().isoformat(),
                 'user_id': self.user.id,
@@ -339,85 +343,85 @@ class NotificationConsumer(BaseConsumer):
                     'message': "Failed to load initial data"
                 }, cls=CustomJSONEncoder))
 
+    @db_sync_to_async
+    def _get_unread_notifications(self):
+        """Get user's unread notifications"""
+        from .models import Notification
+        
+        notifications = Notification.objects.filter(
+            recipient=self.user,
+            is_read=False
+        ).order_by('-created_at')[:50]  # Limit to last 50 unread notifications
+        
+        return [
+            {
+                'id': str(notif.id),
+                'type': notif.notification_type,
+                'message_type': 'trade_completed' if notif.trade_status == 'COMPLETED' else 'trade_update',
+                'short_message': notif.short_message,
+                'detailed_message': notif.detailed_message,
+                'created_at': notif.created_at.isoformat(),
+                'related_url': notif.related_url,
+                'trade_status': notif.trade_status,
+                'trade_id': notif.trade_id,
+                'is_redirectable': notif.is_redirectable,
+                'trade_data': notif.trade_data
+            }
+            for notif in notifications
+        ]
+
     async def new_notification(self, event: Dict) -> None:
         """Handle new notification events"""
         connection_id = self._connection_id
         try:
-            logger.info(f"[{connection_id}] Sending notification to user {self.user.id}")
+            if not self.is_connected:
+                return
+                
+            logger.info(f"[{connection_id}] Received notification event for user {self.user.id}")
+            
+            # Get the message data
+            message = event.get('message', {})
+            message_type = message.get('message_type', 'trade_update')
+            
+            # Log the notification details
+            logger.info(f"[{connection_id}] Notification type: {message_type}, trade_id: {message.get('trade_id')}")
+            
+            # Send the notification to the client
             await self.send(text_data=json.dumps({
                 'type': 'notification',
-                'data': event['message']
+                'data': message
             }, cls=CustomJSONEncoder))
+            
+            logger.info(f"[{connection_id}] Successfully sent notification to user {self.user.id}")
+            
         except Exception as e:
             logger.error(f"[{connection_id}] Error sending notification: {str(e)}", exc_info=True)
 
-    async def trade_update(self, event):
-        """Handle trade update messages."""
+    async def _process_message(self, message_type: str, data: Dict) -> None:
+        """Process incoming messages"""
+        if message_type == 'mark_read':
+            notification_id = data.get('notification_id')
+            if notification_id:
+                await self._mark_notification_read(notification_id)
+        else:
+            await super()._process_message(message_type, data)
+
+    @db_sync_to_async
+    def _mark_notification_read(self, notification_id):
+        """Mark a notification as read"""
+        from .models import Notification
         try:
-            if not self.is_connected or not self.subscription:
-                logger.warning("Consumer not connected or no subscription")
-                return
-
-            data = event["data"]
-            logger.info(f"Processing trade update for trade_id: {data['trade_id']}")
+            notification = Notification.objects.get(
+                id=notification_id,
+                recipient=self.user
+            )
+            notification.is_read = True
+            notification.save()
             
-            # Get trade counts to check remaining slots
-            trade_counts = await self._get_trade_counts()
-            plan_name = self.subscription.plan.name
-            limits = self.company_limits.get(plan_name, {'new': None, 'previous': None, 'total': None})
-            
-            # Calculate remaining trades
-            remaining = {
-                'new': None if limits['new'] is None else max(0, limits['new'] - trade_counts['new']),
-                'previous': None if limits['previous'] is None else max(0, limits['previous'] - trade_counts['previous'])
+            return {
+                'id': str(notification.id),
+                'is_read': True
             }
-
-            # Get updated company data that contains this trade
-            updated_company = await self._get_company_with_trade(data["trade_id"])
-            if not updated_company:
-                logger.warning(f"Company with trade {data['trade_id']} not found")
-                return
-
-            # Check if this is a new trade
-            is_new_trade = updated_company['created_at'] >= self.subscription.start_date.isoformat()
-            
-            # If it's a new trade and user has no remaining new trade slots, don't send update
-            if is_new_trade and remaining['new'] == 0:
-                logger.warning(f"User {self.user.id} has no remaining new trade slots. Skipping update.")
-                return
-
-            # Check if company is accessible based on subscription plan and timing
-            if not await self._is_company_accessible(updated_company['id']):
-                logger.warning(f"Company {updated_company['id']} not accessible to user {self.user.id}")
-                return
-            
-            # Prepare response data
-            response_data = {
-                "type": "trade_update",
-                "data": {
-                    "updated_company": updated_company,
-                    "subscription": {
-                        "plan": self.subscription.plan.name,
-                        "expires_at": self.subscription.end_date.isoformat(),
-                        "limits": limits,
-                        "current": trade_counts,
-                        "remaining": remaining
-                    }
-                }
-            }
-
-            logger.info("Sending trade update to WebSocket")
-            await self.send(text_data=json.dumps(response_data, cls=CustomJSONEncoder))
-            logger.info("Trade update sent successfully")
-
-        except Exception as e:
-            logger.error(f"Error handling trade update: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            await self.send(text_data=json.dumps({
-                "type": "error",
-                "data": {
-                    "message": "Error processing trade update",
-                    "error": str(e)
-                }
-            }, cls=CustomJSONEncoder))
+        except Notification.DoesNotExist:
+            logger.warning(f"Notification {notification_id} not found for user {self.user.id}")
+            return None
