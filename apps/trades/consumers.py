@@ -31,7 +31,7 @@ class TradeUpdateManager:
     """Utility class for managing trade caching and plan level access."""
     
     CACHE_TIMEOUT = 3600  # Cache duration in seconds (1 hour)
-    
+
     @staticmethod
     async def get_cached_trades(cache_key: str) -> Optional[Dict]:
         """Retrieve cached trade data asynchronously."""
@@ -172,7 +172,7 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             
             # If not in URL, try query parameters
             if not token:
-                query_string = self.scope.get('query_string', b'').decode('utf-8')
+            query_string = self.scope.get('query_string', b'').decode('utf-8')
                 parsed_qs = parse_qs(query_string)
                 token = parsed_qs.get('token', [None])[0] or parsed_qs.get('access_token', [None])[0]
 
@@ -554,13 +554,13 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             
         try:
             formatted_trade = {
-                'id': trade.id,
+                    'id': trade.id,
                 'trade_type': trade.trade_type,
-                'status': trade.status,
-                'plan_type': trade.plan_type,
-                'warzone': str(trade.warzone),
-                'image': trade.image.url if trade.image else None,
-                'warzone_history': trade.warzone_history or [],
+                    'status': trade.status,
+                    'plan_type': trade.plan_type,
+                    'warzone': str(trade.warzone),
+                    'image': trade.image.url if trade.image else None,
+                    'warzone_history': trade.warzone_history or [],
                 'analysis': None,
                 'trade_history': []
             }
@@ -583,9 +583,9 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 
                 for history in history_items:
                     history_item = {
-                        'buy': str(history.buy),
-                        'target': str(history.target),
-                        'sl': str(history.sl),
+                            'buy': str(history.buy),
+                            'target': str(history.target),
+                            'sl': str(history.sl),
                         'timestamp': history.timestamp.isoformat(),
                     }
                     
@@ -602,7 +602,7 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                     formatted_trade['trade_history'].append(history_item)
 
             return formatted_trade
-            
+
         except Exception as e:
             logger.error(f"Error formatting trade {trade.id}: {str(e)}")
             return None
