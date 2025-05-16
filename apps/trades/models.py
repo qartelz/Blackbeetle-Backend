@@ -239,31 +239,18 @@ class Trade(models.Model):
                 )
 
     def save(self, *args, **kwargs):
-        """Override save to handle trade status changes and notifications."""
-        is_new = self.pk is None
-        old_status = None
+        is_new = self._state.adding
+        old_status = None if is_new else self.tracker.previous('status')
         
-        if not is_new:
-            old_instance = Trade.objects.get(pk=self.pk)
-            old_status = old_instance.status
-
-        self.clean()  # Run validation before saving
-        
-        if self.status in [self.Status.COMPLETED, self.Status.CANCELLED]:
-            self.completed_at = timezone.now()
-            
-        if not self.id:  # Only on creation
-            now = timezone.now()
-            # Force current year to 2024
-            self.created_at = now.replace(year=2024)
-            self.updated_at = now.replace(year=2024)
-        
+        # Save first
         super().save(*args, **kwargs)
         
-        # Handle status changes and notifications
+        # Only create notification if status has changed
         if not is_new and old_status != self.status:
-            from django.db.models.signals import post_save
-            post_save.send(sender=self.__class__, instance=self, created=False)
+            from .signals import TradeSignalHandler
+            TradeSignalHandler.broadcast_trade_update(self)
+        
+        # Do not create notification here - let the signal handler do it
 
     @classmethod
     def get_available_trade_types(cls, company_token_id):

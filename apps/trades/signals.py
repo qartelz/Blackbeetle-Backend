@@ -189,22 +189,54 @@ class TradeSignalHandler:
     @staticmethod
     def create_trade_notification(trade: Trade, action: str = "updated"):
         try:
+            # Get all active subscriptions
             subscriptions = Subscription.objects.filter(
                 is_active=True,
                 end_date__gt=timezone.now()
             ).select_related('user', 'plan')
 
+            # Track created notifications to prevent duplicates
+            created_notifications = set()
+
             for subscription in subscriptions:
                 if TradeSignalHandler.should_send_trade_update(subscription.user, trade, subscription):
-                    TradeNotification.create_trade_notification(
-                        user=subscription.user,
-                        trade=trade,
-                        notification_type=TradeNotification.NotificationType.TRADE_UPDATE,
-                        message=f"Trade update for {trade.company.trading_symbol}: {action}",
-                        priority=TradeNotification.Priority.HIGH if trade.status == 'ACTIVE' else TradeNotification.Priority.NORMAL
-                    )
+                    # Create a unique key for this notification
+                    notification_key = f"{subscription.user.id}_{trade.id}_{trade.status}"
+                    
+                    # Only create if not already created
+                    if notification_key not in created_notifications:
+                        message_type = "trade_completed" if trade.status == 'COMPLETED' else "trade_update"
+                        message = f"Trade {'completed' if trade.status == 'COMPLETED' else 'updated'}: {trade.company.trading_symbol}"
+                        
+                        TradeNotification.create_trade_notification(
+                            user=subscription.user,
+                            trade=trade,
+                            notification_type=TradeNotification.NotificationType.TRADE_COMPLETED if trade.status == 'COMPLETED' else TradeNotification.NotificationType.TRADE_UPDATE,
+                            message=message
+                        )
+                        
+                        created_notifications.add(notification_key)
+                        
+                        # Send WebSocket update
+                        group_name = f"trade_updates_{subscription.user.id}"
+                        channel_layer = get_channel_layer()
+                        
+                        user_trade_data = TradeUpdateManager.prepare_trade_data(trade, action).copy()
+                        if trade.status == 'COMPLETED':
+                            user_trade_data['message_type'] = 'trade_completed'
+                            
+                        async_to_sync(channel_layer.group_send)(
+                            group_name,
+                            {
+                                "type": "trade_update",
+                                "data": user_trade_data
+                            }
+                        )
+                        
+                        logger.info(f"Sent {trade.status} trade update to user {subscription.user.id} for trade {trade.id}")
+
         except Exception as e:
-            logger.error(f"Error creating trade notifications: {str(e)}")
+            logger.error(f"Error creating trade notification: {str(e)}")
             logger.error(traceback.format_exc())
 
 
