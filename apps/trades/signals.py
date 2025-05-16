@@ -103,36 +103,23 @@ class TradeSignalHandler:
     def get_user_accessible_trades(user, subscription):
         """Get list of trades accessible to user based on subscription."""
         try:
-            plan_name = subscription.plan.name
-            plan_levels = PlanConfig.get_accessible_plans(plan_name)
-            
-            # Get new trades (created after subscription start)
-            new_trades_query = TRADE_MODEL.objects.filter(
+            # Get trades created after subscription start
+            new_trades = TRADE_MODEL.objects.filter(
+                status__in=['ACTIVE', 'COMPLETED'],
                 created_at__gte=subscription.start_date,
-                plan_type__in=plan_levels,
-                status__in=['ACTIVE', 'COMPLETED']
-            ).order_by('created_at')
-            
-            # Apply plan-specific limits for new trades
-            if plan_name == 'BASIC':
-                new_trades = new_trades_query[:6]  # 6 trades for BASIC
-            elif plan_name == 'PREMIUM':
-                new_trades = new_trades_query[:9]  # 9 trades for PREMIUM
-            else:  # SUPER_PREMIUM or FREE_TRIAL
-                new_trades = new_trades_query.all()
-            
-            # Get previous trades (fixed set of 6 oldest)
+                plan_type__in=PlanConfig.get_accessible_plans(subscription.plan.name)
+            )
+
+            # Get previously active trades from before subscription
             previous_trades = TRADE_MODEL.objects.filter(
+                status__in=['ACTIVE', 'COMPLETED'],
                 created_at__lt=subscription.start_date,
-                status__in=['ACTIVE', 'COMPLETED']
-            ).order_by('-created_at')[:6]
-            
-            # Combine both sets
-            accessible_trade_ids = set(new_trades.values_list('id', flat=True)) | set(previous_trades.values_list('id', flat=True))
-            
-            logger.info(f"User {user.id} accessible trades: {accessible_trade_ids}")
-            return accessible_trade_ids
-        
+                status_changed_at__gte=subscription.start_date
+            )
+
+            # Combine both querysets
+            accessible_trades = new_trades.union(previous_trades)
+            return set(accessible_trades.values_list('id', flat=True))
         except Exception as e:
             logger.error(f"Error getting accessible trades: {str(e)}")
             logger.error(traceback.format_exc())
@@ -141,23 +128,21 @@ class TradeSignalHandler:
     @staticmethod
     def should_send_trade_update(user, trade, subscription):
         try:
-            # Get user's accessible trades
+            # If trade is not completed, use existing logic
+            if trade.status != 'COMPLETED':
+                if trade.created_at < subscription.start_date:
+                    return True
+
+                if subscription.plan.name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
+                    return True
+
+                active_count = TradeSignalHandler.get_user_active_trade_count(user, subscription)
+                plan_limit = PlanConfig.get_trade_limit(subscription.plan.name)
+                return active_count < plan_limit
+
+            # For completed trades, check if user had access to this trade
             accessible_trades = TradeSignalHandler.get_user_accessible_trades(user, subscription)
-            
-            # If trade is completed, only send if it was in user's accessible list
-            if trade.status == 'COMPLETED':
-                is_accessible = trade.id in accessible_trades
-                logger.info(f"Completed trade {trade.id} accessibility for user {user.id}: {is_accessible}")
-                return is_accessible
-            
-            # For active trades, check subscription limits
-            if subscription.plan.name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
-                return True
-            
-            active_count = TradeSignalHandler.get_user_active_trade_count(user, subscription)
-            plan_limit = PlanConfig.get_trade_limit(subscription.plan.name)
-            
-            return active_count < plan_limit
+            return trade.id in accessible_trades
 
         except Exception as e:
             logger.error(f"Error checking trade update eligibility: {str(e)}")
