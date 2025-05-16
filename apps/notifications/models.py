@@ -262,13 +262,13 @@ class TradeNotification(models.Model):
 @staticmethod
 def create_trade_notification(trade: Trade, action: str = "updated"):
     try:
+        # Add a time threshold to prevent duplicates (e.g., 5 seconds)
+        recent_notification_threshold = timezone.now() - timedelta(seconds=5)
+
         subscriptions = Subscription.objects.filter(
             is_active=True,
             end_date__gt=timezone.now()
         ).select_related('user', 'plan')
-
-        # Add a time threshold to prevent duplicates (e.g., 5 seconds)
-        recent_notification_threshold = timezone.now() - timedelta(seconds=5)
 
         for subscription in subscriptions:
             if TradeSignalHandler.should_send_trade_update(subscription.user, trade, subscription):
@@ -286,11 +286,17 @@ def create_trade_notification(trade: Trade, action: str = "updated"):
                         else TradeNotification.NotificationType.TRADE_UPDATE
                     )
                     
+                    message = (
+                        f"Trade completed for {trade.company.trading_symbol}"
+                        if trade.status == 'COMPLETED'
+                        else f"Trade update for {trade.company.trading_symbol}: {action}"
+                    )
+                    
                     TradeNotification.create_trade_notification(
                         user=subscription.user,
                         trade=trade,
                         notification_type=notification_type,
-                        message=f"Trade {'completed' if trade.status == 'COMPLETED' else 'update'} for {trade.company.trading_symbol}",
+                        message=message,
                         priority=TradeNotification.Priority.HIGH if trade.status == 'ACTIVE' else TradeNotification.Priority.NORMAL
                     )
                     logger.info(f"Created notification for user {subscription.user.id} for trade {trade.id}")
