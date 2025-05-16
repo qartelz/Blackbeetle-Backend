@@ -286,16 +286,17 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
         """Get current trade counts for the user."""
         try:
             from .models import Trade
+            from django.db import models
             
             # Get plan limits
             plan_limits = {
                 'BASIC': {'new': 6, 'previous': 6},
                 'PREMIUM': {'new': 9, 'previous': 6},
-                'SUPER_PREMIUM': {'new': None, 'previous': None},
-                'FREE_TRIAL': {'new': None, 'previous': None}
+                'SUPER_PREMIUM': {'new': None, 'previous': 6},
+                'FREE_TRIAL': {'new': None, 'previous': 6}
             }
             
-            limits = plan_limits.get(self.subscription.plan.name, {'new': None, 'previous': None})
+            limits = plan_limits.get(self.subscription.plan.name, {'new': None, 'previous': 6})
             
             # Get all trades for logging
             all_trades = Trade.objects.filter(
@@ -306,11 +307,12 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             for trade in all_trades:
                 logger.info(f"Trade {trade.id}: created={trade.created_at}, completed={trade.completed_at}, status={trade.status}")
             
-            # Get previous trades (before subscription)
-            # Get the 6 most recent trades created before subscription
+            # Get the 6 most recent trades that were active at subscription time
+            # These trades will remain fixed for the duration of the subscription
             previous_trades = Trade.objects.filter(
-                created_at__lt=self.subscription.start_date,
-                plan_type__in=self.trade_manager.get_plan_levels(self.subscription.plan.name)
+                created_at__lt=self.subscription.start_date,  # Created before subscription
+                plan_type__in=self.trade_manager.get_plan_levels(self.subscription.plan.name),
+                status__in=['ACTIVE', 'COMPLETED']  # Exclude PENDING
             ).order_by('-created_at')[:6]  # Get 6 most recent
             
             # Log previous trades
@@ -321,10 +323,11 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             # Get new trades (after subscription)
             new_trades = Trade.objects.filter(
                 created_at__gte=self.subscription.start_date,
-                plan_type__in=self.trade_manager.get_plan_levels(self.subscription.plan.name)
+                plan_type__in=self.trade_manager.get_plan_levels(self.subscription.plan.name),
+                status__in=['ACTIVE', 'COMPLETED']  # Exclude PENDING
             ).order_by('-created_at')
             
-            # Apply limit for new trades
+            # Apply limit for new trades if applicable
             if limits['new'] is not None:
                 new_trades = new_trades[:limits['new']]
             
@@ -403,13 +406,11 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                         status__in=['ACTIVE', 'COMPLETED']  # Exclude PENDING
                     ).select_related('analysis').prefetch_related('history')
                     
-                    # Check if this company had trades active at subscription start
+                    # Get trades created before subscription
+                    # These will be the fixed set of previous trades
                     pre_subscription_trades = [
                         t for t in company_trades 
-                        if t.created_at < subscription_start and (
-                            t.completed_at is None or  # Still active
-                            t.completed_at >= subscription_start  # Completed after subscription
-                        )
+                        if t.created_at < subscription_start
                     ]
                     
                     # Check if this company has new trades created after subscription start
@@ -450,14 +451,14 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                         }
                         new_companies_data.append(company_data)
                         
-                    # If no post-subscription trades but had active trades at subscription time, it's a "previous" company
+                    # If we have pre-subscription trades, it's a "previous" company
                     elif pre_subscription_trades:
                         # Find first intraday and positional trades for this company
                         intraday_trade = None
                         positional_trade = None
                         
-                        # Sort trades by creation date (oldest first)
-                        sorted_trades = sorted(pre_subscription_trades, key=lambda t: t.created_at)
+                        # Sort trades by creation date (newest first)
+                        sorted_trades = sorted(pre_subscription_trades, key=lambda t: t.created_at, reverse=True)
                         
                         # Take the first trade of each type
                         for trade in sorted_trades:
@@ -478,24 +479,24 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                             'instrumentName': self._get_instrument_name(company.instrument_type),
                             'intraday_trade': self._format_trade(intraday_trade) if intraday_trade else None,
                             'positional_trade': self._format_trade(positional_trade) if positional_trade else None,
-                            'created_at': min([t.created_at for t in pre_subscription_trades]).isoformat() if pre_subscription_trades else None
+                            'created_at': max([t.created_at for t in pre_subscription_trades]).isoformat() if pre_subscription_trades else None
                         }
                         previous_companies_data.append(company_data)
                 
-                # Sort both collections by created_at (oldest first)
+                # Sort both collections by created_at (newest first for previous, oldest first for new)
                 new_companies_data.sort(key=lambda x: x['created_at'] if x['created_at'] else '')
-                previous_companies_data.sort(key=lambda x: x['created_at'] if x['created_at'] else '')
+                previous_companies_data.sort(key=lambda x: x['created_at'] if x['created_at'] else '', reverse=True)
                 
                 # Apply limits based on plan
+                # All plans get 6 previous trades (most recent ones)
+                previous_companies_data = previous_companies_data[:6]
+                
+                # Apply new trade limits based on plan
                 if plan_name == 'BASIC':
-                    # For BASIC: 6 previous + 6 new
-                    previous_companies_data = previous_companies_data[:6]
-                    new_companies_data = new_companies_data[:6]
+                    new_companies_data = new_companies_data[:6]  # 6 new trades for BASIC
                 elif plan_name == 'PREMIUM':
-                    # For PREMIUM: 6 previous + 9 new
-                    previous_companies_data = previous_companies_data[:6]
-                    new_companies_data = new_companies_data[:9]
-                # No limits for SUPER_PREMIUM and FREE_TRIAL
+                    new_companies_data = new_companies_data[:9]  # 9 new trades for PREMIUM
+                # No limit on new trades for SUPER_PREMIUM and FREE_TRIAL
                 
                 logger.info(f"After filtering: {len(previous_companies_data)} previous companies, {len(new_companies_data)} new companies")
                 
@@ -507,7 +508,7 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 }
                 
                 # Get plan limits
-                plan_limits = self.company_limits.get(plan_name, {'new': None, 'previous': None, 'total': None})
+                plan_limits = self.company_limits.get(plan_name, {'new': None, 'previous': 6})  # Default to 6 previous trades
                 
                 # Return structured data
                 return {
@@ -532,7 +533,7 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                     'plan': self.subscription.plan.name,
                     'expires_at': self.subscription.end_date.isoformat(),
                     'limits': self.company_limits.get(self.subscription.plan.name, 
-                                                    {'new': None, 'previous': None, 'total': None}),
+                                                    {'new': None, 'previous': 6}),  # Default to 6 previous trades
                     'counts': {'new': 0, 'previous': 0, 'total': 0}
                 }
             }
