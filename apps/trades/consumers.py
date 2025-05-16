@@ -333,7 +333,7 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             # Log new trades
             logger.info(f"New trades for user {self.user.id}:")
             for trade in new_trades:
-                logger.info(f"New Trade {trade.id}: created={trade.created_at}, completed={trade.completed_at}, status={trade.status}")
+                # logger.info(f"New Trade {trade.id}: created={trade.created_at}, completed={trade.completed_at}, status={trade.status}")
             
             # Count trades
             previous_count = len(previous_trades)  # Always 6 for previous trades
@@ -345,7 +345,7 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 'total': new_count + previous_count
             }
             
-            logger.info(f"Final counts for user {self.user.id}: {counts}")
+            # logger.info(f"Final counts for user {self.user.id}: {counts}")
             
             return counts
             
@@ -944,13 +944,13 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 new_companies.add(trade.company.id)
             
             # Log the trades for debugging
-            logger.info(f"Previous trades for user {self.user.id}:")
-            for trade in previous_trades:
-                logger.info(f"Previous Trade {trade.id}: {trade.company.trading_symbol} - created={trade.created_at}, completed={trade.completed_at}, status={trade.status}")
+            # logger.info(f"Previous trades for user {self.user.id}:")
+            # for trade in previous_trades:
+            #     logger.info(f"Previous Trade {trade.id}: {trade.company.trading_symbol} - created={trade.created_at}, completed={trade.completed_at}, status={trade.status}")
             
-            logger.info(f"New trades for user {self.user.id}:")
-            for trade in new_trades:
-                logger.info(f"New Trade {trade.id}: {trade.company.trading_symbol} - created={trade.created_at}, completed={trade.completed_at}, status={trade.status}")
+            # logger.info(f"New trades for user {self.user.id}:")
+            # for trade in new_trades:
+            #     logger.info(f"New Trade {trade.id}: {trade.company.trading_symbol} - created={trade.created_at}, completed={trade.completed_at}, status={trade.status}")
             
             # Return counts
             new_count = len(new_companies)
@@ -1088,7 +1088,7 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             return True
             
         except Exception as e:
-            logger.error(f"Error checking if user can get new trade: {str(e)}")
+            # logger.error(f"Error checking if user can get new trade: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
             return False
