@@ -100,18 +100,50 @@ class TradeSignalHandler:
             return 0
 
     @staticmethod
+    def get_user_accessible_trades(user, subscription):
+        """Get list of trades accessible to user based on subscription."""
+        try:
+            # Get trades created after subscription start
+            new_trades = TRADE_MODEL.objects.filter(
+                status__in=['ACTIVE', 'COMPLETED'],
+                created_at__gte=subscription.start_date,
+                plan_type__in=PlanConfig.get_accessible_plans(subscription.plan.name)
+            )
+
+            # Get previously active trades from before subscription
+            previous_trades = TRADE_MODEL.objects.filter(
+                status__in=['ACTIVE', 'COMPLETED'],
+                created_at__lt=subscription.start_date,
+                status_changed_at__gte=subscription.start_date
+            )
+
+            # Combine both querysets
+            accessible_trades = new_trades.union(previous_trades)
+            return set(accessible_trades.values_list('id', flat=True))
+        except Exception as e:
+            logger.error(f"Error getting accessible trades: {str(e)}")
+            logger.error(traceback.format_exc())
+            return set()
+
+    @staticmethod
     def should_send_trade_update(user, trade, subscription):
         try:
-            if trade.created_at < subscription.start_date:
-                return True
+            # If trade is not completed, use existing logic
+            if trade.status != 'COMPLETED':
+                if trade.created_at < subscription.start_date:
+                    return True
 
-            if subscription.plan.name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
-                return True
+                if subscription.plan.name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
+                    return True
 
-            active_count = TradeSignalHandler.get_user_active_trade_count(user, subscription)
-            plan_limit = PlanConfig.get_trade_limit(subscription.plan.name)
+                active_count = TradeSignalHandler.get_user_active_trade_count(user, subscription)
+                plan_limit = PlanConfig.get_trade_limit(subscription.plan.name)
+                return active_count < plan_limit
 
-            return active_count < plan_limit
+            # For completed trades, check if user had access to this trade
+            accessible_trades = TradeSignalHandler.get_user_accessible_trades(user, subscription)
+            return trade.id in accessible_trades
+
         except Exception as e:
             logger.error(f"Error checking trade update eligibility: {str(e)}")
             logger.error(traceback.format_exc())
@@ -123,21 +155,33 @@ class TradeSignalHandler:
             channel_layer = get_channel_layer()
             trade_data = TradeUpdateManager.prepare_trade_data(trade, action)
 
+            # Get all active subscriptions
             subscriptions = Subscription.objects.filter(
                 is_active=True,
                 end_date__gt=timezone.now()
             ).select_related('user', 'plan')
 
             for subscription in subscriptions:
+                # Check if user should receive this update
                 if TradeSignalHandler.should_send_trade_update(subscription.user, trade, subscription):
                     group_name = f"trade_updates_{subscription.user.id}"
+                    
+                    # Add subscription-specific data
+                    user_trade_data = trade_data.copy()
+                    if trade.status == 'COMPLETED':
+                        user_trade_data['message_type'] = 'trade_completed'
+                        
                     async_to_sync(channel_layer.group_send)(
                         group_name,
                         {
                             "type": "trade_update",
-                            "data": trade_data
+                            "data": user_trade_data
                         }
                     )
+                    logger.info(f"Sent {trade.status} trade update to user {subscription.user.id} for trade {trade.id}")
+                else:
+                    logger.info(f"Skipped sending trade {trade.id} update to user {subscription.user.id} - not accessible")
+
         except Exception as e:
             logger.error(f"Error broadcasting trade update: {str(e)}")
             logger.error(traceback.format_exc())
@@ -169,9 +213,13 @@ def handle_trade_update(sender, instance, created, **kwargs):
     """Handle trade updates and broadcast to relevant users."""
     try:
         action = "created" if created else "updated"
-        if instance.status == 'ACTIVE':
+        
+        # Handle both ACTIVE and COMPLETED trades
+        if instance.status in ['ACTIVE', 'COMPLETED']:
             TradeSignalHandler.broadcast_trade_update(instance, action)
             TradeSignalHandler.create_trade_notification(instance, action)
+            
+            logger.info(f"Processed trade {instance.id} update - Status: {instance.status}, Action: {action}")
     except Exception as e:
         logger.error(f"Error handling trade update signal: {str(e)}")
         logger.error(traceback.format_exc())
