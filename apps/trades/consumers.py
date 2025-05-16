@@ -172,7 +172,7 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             
             # If not in URL, try query parameters
             if not token:
-            query_string = self.scope.get('query_string', b'').decode('utf-8')
+                query_string = self.scope.get('query_string', b'').decode('utf-8')
                 parsed_qs = parse_qs(query_string)
                 token = parsed_qs.get('token', [None])[0] or parsed_qs.get('access_token', [None])[0]
 
