@@ -636,58 +636,46 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 return
 
             data = event["data"]
-            logger.info(f"Processing trade update for trade_id: {data['trade_id']}")
+            trade_id = data["trade_id"]
+            logger.info(f"Processing trade update for trade_id: {trade_id}")
             
             # Get trade info first
-            trade_info = await self._get_trade_info(data["trade_id"])
+            trade_info = await self._get_trade_info(trade_id)
             if not trade_info:
-                logger.warning(f"Trade {data['trade_id']} not found")
+                logger.warning(f"Trade {trade_id} not found")
                 return
 
-            # Get current trade counts and limits
-            trade_counts = await self._get_trade_counts()
-            plan_name = self.subscription.plan.name
-            limits = self.company_limits.get(plan_name, {'new': None, 'previous': 6})
-            
-            # Calculate remaining slots
-            remaining = {
-                'new': None if limits['new'] is None else max(0, limits['new'] - trade_counts['new']),
-                'previous': None if limits['previous'] is None else max(0, limits['previous'] - trade_counts['previous']),
-                'total': None if limits['total'] is None else max(0, limits['total'] - trade_counts['total'])
-            }
-
-            trade_status = trade_info['status']
-            trade_created_at = trade_info['created_at']
-            is_new_trade = trade_created_at >= self.subscription.start_date if trade_created_at else False
-
-            # Get updated company data that contains this trade
-            updated_company = await self._get_company_with_trade(data["trade_id"])
-            if not updated_company:
-                logger.warning(f"Company with trade {data['trade_id']} not found")
-                return
-
-            # Check if this trade is in the user's accessible list
-            is_eligible = False
-            
-            # Get the user's accessible trades
+            # Get user's accessible trades
             accessible_trades = await self._get_accessible_trades()
-            trade_id = data["trade_id"]
-            
-            # Check if the trade is in the user's accessible list
-            if trade_id in accessible_trades['previous_trades'] or trade_id in accessible_trades['new_trades']:
-                is_eligible = True
-                logger.info(f"Trade {trade_id} found in user's accessible trades")
-            else:
-                logger.info(f"Trade {trade_id} not found in user's accessible trades")
+            is_accessible = (
+                trade_id in accessible_trades['previous_trades'] or 
+                trade_id in accessible_trades['new_trades']
+            )
 
-            # Only send update if user is eligible
-            if is_eligible:
-                # Determine message type based on trade status
-                message_type = data.get('message_type', 'trade_update')
-                if trade_status == 'COMPLETED':
-                    message_type = 'trade_completed'
+            # Only proceed if trade is accessible
+            if is_accessible:
+                # Get current trade counts and limits
+                trade_counts = await self._get_trade_counts()
+                plan_name = self.subscription.plan.name
+                limits = self.company_limits.get(plan_name, {'new': None, 'previous': 6})
                 
-                # Prepare response data with updated subscription info
+                # Calculate remaining slots
+                remaining = {
+                    'new': None if limits['new'] is None else max(0, limits['new'] - trade_counts['new']),
+                    'previous': None if limits['previous'] is None else max(0, limits['previous'] - trade_counts['previous']),
+                    'total': None if limits['total'] is None else max(0, limits['total'] - trade_counts['total'])
+                }
+
+                # Get updated company data
+                updated_company = await self._get_company_with_trade(trade_id)
+                if not updated_company:
+                    logger.warning(f"Company with trade {trade_id} not found")
+                    return
+
+                # Determine message type based on trade status
+                message_type = 'trade_completed' if trade_info['status'] == 'COMPLETED' else 'trade_update'
+                
+                # Prepare response data
                 response_data = {
                     "type": message_type,
                     "data": {
@@ -707,11 +695,10 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 await self.send(text_data=json.dumps(response_data, cls=DecimalEncoder))
                 logger.info(f"{message_type} sent successfully")
             else:
-                logger.info(f"Silently ignoring trade update for ineligible user {self.user.id}")
+                logger.info(f"Skipping trade update for trade {trade_id} - not accessible to user {self.user.id}")
 
         except Exception as e:
             logger.error(f"Error handling trade update: {str(e)}")
-            import traceback
             logger.error(traceback.format_exc())
 
     @db_sync_to_async
