@@ -151,6 +151,10 @@ class TradeSignalHandler:
     def process_trade_update(trade: Trade, action: str = "updated"):
         """Unified method to handle trade updates - creates notification and sends WebSocket update"""
         try:
+            # Skip notifications for PENDING trades
+            if trade.status == 'PENDING':
+                return
+            
             # Get all active subscriptions
             subscriptions = Subscription.objects.filter(
                 is_active=True,
@@ -206,9 +210,8 @@ class TradeSignalHandler:
                         }
                     )
                     
-        except Exception as e:
-            logger.error(f"Error processing trade update: {str(e)}")
-            # Don't re-raise exception
+        except Exception:
+            pass
 
 
 @receiver(post_save, sender=Trade)

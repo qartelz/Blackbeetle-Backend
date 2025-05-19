@@ -7,6 +7,7 @@ from decimal import Decimal
 from django.db import transaction
 from model_utils import FieldTracker
 import logging
+from datetime import timedelta
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -895,6 +896,23 @@ class TradeNotification(models.Model):
     @classmethod
     def create_trade_notification(cls, user, trade, notification_type, message, priority=Priority.NORMAL):
         """Create a new trade notification."""
+        # Skip notifications for PENDING trades
+        if trade.status == 'PENDING':
+            return None
+        
+        # Check for duplicate notifications in the last minute
+        recent_notification = cls.objects.filter(
+            user=user,
+            trade=trade,
+            notification_type=notification_type,
+            created_at__gte=timezone.now() - timedelta(minutes=1)
+        ).first()
+        
+        if recent_notification:
+            # Don't create duplicate notifications within a short time period
+            return recent_notification
+        
+        # Create the notification
         return cls.objects.create(
             user=user,
             trade=trade,
