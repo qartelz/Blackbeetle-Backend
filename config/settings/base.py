@@ -44,7 +44,7 @@ INSTALLED_APPS = [
     # 'drf_yasg',
     'django_filters',
     'storages',
-    'stockreports',
+    
     
     # 'cloudinary_storage',  # For Cloudinary storage
     # 'cloudinary',  
@@ -60,6 +60,7 @@ INSTALLED_APPS = [
     'apps.analytics.apps.AnalyticsConfig',
     'apps.accuracy.apps.AccuracyConfig',
     'apps.events.apps.EventsConfig',
+    'apps.stockreports.apps.StockreportsConfig',
 ]
 
 MIDDLEWARE = [
