@@ -98,6 +98,14 @@ class TradeSignalHandler:
     def get_user_accessible_trades(user, subscription):
         """Get list of trades accessible to user based on subscription."""
         try:
+            # Special handling for SUPER_PREMIUM and FREE_TRIAL users - get ALL trades
+            if subscription.plan.name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
+                all_trades = TRADE_MODEL.objects.filter(
+                    status__in=['ACTIVE', 'COMPLETED']
+                ).values_list('id', flat=True)
+                return set(all_trades)
+            
+            # Standard logic for other plan types
             # Get trades created after subscription start
             new_trades = TRADE_MODEL.objects.filter(
                 status__in=['ACTIVE', 'COMPLETED'],
@@ -120,24 +128,23 @@ class TradeSignalHandler:
 
     @staticmethod
     def should_send_trade_update(user, trade, subscription):
+        """
+        Determine if a user should receive an update for a specific trade based on
+        their subscription level and whether the trade is in their accessible list.
+        """
         try:
-            # If trade is not completed, use existing logic
-            if trade.status != 'COMPLETED':
-                if trade.created_at < subscription.start_date:
-                    return True
-
-                if subscription.plan.name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
-                    return True
-
-                active_count = TradeSignalHandler.get_user_active_trade_count(user, subscription)
-                plan_limit = PlanConfig.get_trade_limit(subscription.plan.name)
-                return active_count < plan_limit
-
-            # For completed trades, check if user had access to this trade
+            # Special case: SUPER_PREMIUM and FREE_TRIAL users always get all trade updates
+            if subscription.plan.name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
+                return True
+            
+            # Get list of trades this user has access to
             accessible_trades = TradeSignalHandler.get_user_accessible_trades(user, subscription)
+            
+            # Only send updates for trades the user has access to
             return trade.id in accessible_trades
-
-        except Exception:
+        
+        except Exception as e:
+            logger.error(f"Error checking if user {user.id} should receive trade update: {str(e)}")
             return False
 
     @staticmethod
@@ -159,11 +166,12 @@ class TradeSignalHandler:
             # Process notification for each eligible user
             created_notifications = set()
 
+            # Process users based on access rules
             for subscription in subscriptions:
                 user = subscription.user
                 
-                # Check if user should receive this update
-                if TradeSignalHandler.should_send_trade_update(user, trade, subscription):
+                # Check if user should receive this update using Trade model's helper
+                if trade.is_trade_accessible(user, subscription):
                     # Create unique key for this notification
                     notification_key = f"{user.id}_{trade.id}_{trade.status}"
                     
@@ -198,8 +206,9 @@ class TradeSignalHandler:
                         }
                     )
                     
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Error processing trade update: {str(e)}")
+            # Don't re-raise exception
 
 
 @receiver(post_save, sender=Trade)

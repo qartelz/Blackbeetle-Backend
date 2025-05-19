@@ -348,34 +348,92 @@ class Trade(models.Model):
             logger.info(f"SUPER_PREMIUM plan: returning {result.count()} trades")
             return result
 
-    def is_accessible_to_user(self, user):
+    def is_trade_accessible(self, user, subscription=None):
         """
-        Check if a trade is accessible to a user based on their subscription.
+        Check if this trade should be accessible to a user based on their subscription.
+        
+        Args:
+            user: The user to check access for
+            subscription: Optional subscription object. If not provided, will fetch active subscription
+            
+        Returns:
+            bool: True if user should have access to this trade, False otherwise
         """
-        if not user.is_authenticated:
+        try:
+            # If no subscription provided, get active one
+            if not subscription:
+                from apps.subscriptions.models import Subscription
+                subscription = Subscription.objects.filter(
+                    user=user,
+                    is_active=True,
+                    end_date__gt=timezone.now()
+                ).first()
+                
+            if not subscription:
+                return False
+                
+            # SUPER_PREMIUM and FREE_TRIAL get access to all trades
+            if subscription.plan.name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
+                return True
+                
+            # For other plans, check if trade is in their allowed plan types
+            allowed_plan_types = {
+                'BASIC': ['BASIC'],
+                'PREMIUM': ['BASIC', 'PREMIUM'],
+            }.get(subscription.plan.name, [])
+            
+            if self.plan_type not in allowed_plan_types:
+                return False
+                
+            # Check if trade was created after subscription start (new trade)
+            if self.created_at >= subscription.start_date:
+                # Check limits based on plan type
+                if subscription.plan.name == 'BASIC':
+                    # Get count of new trades for this user (up to 6)
+                    new_trade_count = Trade.objects.filter(
+                        status__in=['ACTIVE', 'COMPLETED'],
+                        created_at__gte=subscription.start_date,
+                        plan_type__in=['BASIC']
+                    ).count()
+                    # Check if within limit or this is already one of their trades
+                    return new_trade_count <= 6 or self in Trade.objects.filter(
+                        status__in=['ACTIVE', 'COMPLETED'],
+                        created_at__gte=subscription.start_date,
+                        plan_type__in=['BASIC']
+                    )[:6]
+                elif subscription.plan.name == 'PREMIUM':
+                    # Get count of new trades for this user (up to 9)
+                    new_trade_count = Trade.objects.filter(
+                        status__in=['ACTIVE', 'COMPLETED'],
+                        created_at__gte=subscription.start_date,
+                        plan_type__in=['BASIC', 'PREMIUM']
+                    ).count()
+                    # Check if within limit or this is already one of their trades
+                    return new_trade_count <= 9 or self in Trade.objects.filter(
+                        status__in=['ACTIVE', 'COMPLETED'],
+                        created_at__gte=subscription.start_date,
+                        plan_type__in=['BASIC', 'PREMIUM']
+                    )[:9]
+                    
+            # Check if trade was active at subscription time (previous trade)
+            elif self.created_at < subscription.start_date and self.status == 'ACTIVE':
+                # All plans get up to 6 previous trades
+                previous_trade_count = Trade.objects.filter(
+                    status__in=['ACTIVE', 'COMPLETED'],
+                    created_at__lt=subscription.start_date
+                ).count()
+                # Check if within limit or this is already one of their trades
+                return previous_trade_count <= 6 or self in Trade.objects.filter(
+                    status__in=['ACTIVE', 'COMPLETED'],
+                    created_at__lt=subscription.start_date
+                )[:6]
+                
+            # Not a new or previous trade, no access
             return False
-
-        subscription = user.get_active_subscription()
-        if not subscription:
+            
+        except Exception as e:
+            logger.error(f"Error checking trade access: {str(e)}")
             return False
-
-        # Free trial users get same access as SUPER_PREMIUM
-        if subscription.plan.name == 'FREE_TRIAL':
-            return True
-
-        # Check if trade was created after user's subscription
-        if self.created_at < subscription.start_date:
-            return False
-
-        # Check plan type access
-        if subscription.plan.name == 'BASIC':
-            return self.plan_type in ['BASIC', 'PREMIUM', 'SUPER_PREMIUM']
-        elif subscription.plan.name == 'PREMIUM':
-            return self.plan_type in ['PREMIUM', 'SUPER_PREMIUM']
-        elif subscription.plan.name == 'SUPER_PREMIUM':
-            return self.plan_type == 'SUPER_PREMIUM'
-
-        return False
 
 class TradeHistory(models.Model):
     trade = models.ForeignKey(

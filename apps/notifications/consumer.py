@@ -14,6 +14,7 @@ from enum import Enum
 import uuid
 from django.db import transaction
 from django.core.cache import cache
+from django.contrib.contenttypes.models import ContentType
 
 logger = logging.getLogger(__name__)
 
@@ -308,28 +309,6 @@ class NotificationConsumer(BaseConsumer):
             logger.error(f"Error setting up user group: {str(e)}")
             return False
 
-
-# class NotificationConsumer(BaseConsumer):
-#     """
-#     WebSocket consumer for handling real-time notifications.
-#     """
-    
-#     def __init__(self, *args: Any, **kwargs: Any) -> None:
-#         super().__init__(*args, **kwargs)
-    
-#     async def _setup_user_group(self) -> bool:
-#         """Set up notification group for the user"""
-#         connection_id = self._connection_id
-#         try:
-#             self.user_group = f"notification_updates_{self.user.id}"
-#             await self.channel_layer.group_add(self.user_group, self.channel_name)
-#             logger.info(f"[{connection_id}] Added to group {self.user_group}")
-#             return True
-            
-#         except Exception as e:
-#             logger.error(f"[{connection_id}] Error setting up user group: {str(e)}", exc_info=True)
-#             return False
-
     async def send_initial_data(self) -> None:
         """Send initial notification data"""
         connection_id = self._connection_id
@@ -367,28 +346,53 @@ class NotificationConsumer(BaseConsumer):
     def _get_unread_notifications(self):
         """Get user's unread notifications"""
         from .models import Notification
+        from apps.subscriptions.models import Subscription
         
-        notifications = Notification.objects.filter(
-            recipient=self.user,
-            is_read=False
-        ).order_by('-created_at')[:50]  # Limit to last 50 unread notifications
-        
-        return [
-            {
-                'id': str(notif.id),
-                'type': notif.notification_type,
-                'message_type': 'trade_completed' if notif.trade_status == 'COMPLETED' else 'trade_update',
-                'short_message': notif.short_message,
-                'detailed_message': notif.detailed_message,
-                'created_at': notif.created_at.isoformat(),
-                'related_url': notif.related_url,
-                'trade_status': notif.trade_status,
-                'trade_id': notif.trade_id,
-                'is_redirectable': notif.is_redirectable,
-                'trade_data': notif.trade_data
-            }
-            for notif in notifications
-        ]
+        try:
+            # Check if user has a premium subscription
+            is_premium = False
+            try:
+                subscription = Subscription.objects.get(
+                    user=self.user,
+                    is_active=True,
+                    end_date__gt=timezone.now()
+                )
+                is_premium = subscription.plan.name in ['SUPER_PREMIUM', 'FREE_TRIAL']
+            except Subscription.DoesNotExist:
+                pass
+            
+            # Simply retrieve existing notifications for the user
+            notifications_query = Notification.objects.filter(
+                recipient=self.user,
+                is_read=False
+            )
+            
+            # For premium users, get up to 100 notifications
+            if is_premium:
+                notifications = notifications_query.order_by('-created_at')[:100]
+            else:
+                # For regular users, limit to 50
+                notifications = notifications_query.order_by('-created_at')[:50]
+            
+            return [
+                {
+                    'id': str(notif.id),
+                    'type': notif.notification_type,
+                    'message_type': 'trade_completed' if notif.trade_status == 'COMPLETED' else 'trade_update',
+                    'short_message': notif.short_message,
+                    'detailed_message': notif.detailed_message,
+                    'created_at': notif.created_at.isoformat(),
+                    'related_url': notif.related_url,
+                    'trade_status': notif.trade_status,
+                    'trade_id': notif.trade_id,
+                    'is_redirectable': notif.is_redirectable,
+                    'trade_data': notif.trade_data
+                }
+                for notif in notifications
+            ]
+        except Exception as e:
+            logger.error(f"Error getting unread notifications: {str(e)}")
+            return []
 
     async def new_notification(self, event: Dict) -> None:
         """Handle new notification events"""

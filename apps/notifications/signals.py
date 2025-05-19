@@ -119,6 +119,20 @@ class NotificationManager:
         plan_name = subscription.plan.name
         plan_levels = NotificationManager.get_plan_levels(plan_name)
         
+        # Special handling for SUPER_PREMIUM and FREE_TRIAL users
+        if plan_name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
+            # Get all trades regardless of when they were created
+            all_trades = Trade.objects.filter(
+                status__in=['ACTIVE', 'COMPLETED']
+            ).values_list('id', flat=True)
+            
+            return {
+                'previous_trades': list(all_trades),
+                'new_trades': list(all_trades)
+            }
+        
+        # Normal handling for other subscription types - keep the existing logic
+        
         # Get previous trades (fixed set of 6)
         previous_trades = Trade.objects.filter(
             created_at__lt=subscription_start,
@@ -138,7 +152,8 @@ class NotificationManager:
             new_trades = new_trades_query[:6]
         elif plan_name == 'PREMIUM':
             new_trades = new_trades_query[:9]
-        else:  # SUPER_PREMIUM or FREE_TRIAL
+        else:
+            # Default behavior for other plans
             new_trades = new_trades_query.all()
         
         new_trade_ids = list(new_trades.values_list('id', flat=True))
@@ -156,9 +171,11 @@ class NotificationManager:
         
         # Get active subscriptions with plans that can access this trade
         eligible_plans = NotificationManager.get_plan_levels(trade.plan_type)
+        eligible_plans_with_premium = eligible_plans + ['SUPER_PREMIUM', 'FREE_TRIAL']
         
+        # Get active subscriptions for eligible plans
         active_subscriptions = Subscription.objects.filter(
-            plan__name__in=eligible_plans,
+            plan__name__in=eligible_plans_with_premium,
             is_active=True,
             start_date__lte=timezone.now(),
             end_date__gt=timezone.now()
@@ -166,7 +183,12 @@ class NotificationManager:
         
         eligible_users = []
         for subscription in active_subscriptions:
-            # Get accessible trades for this user
+            # SUPER_PREMIUM and FREE_TRIAL users should always be eligible
+            if subscription.plan.name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
+                eligible_users.append(subscription.user.id)
+                continue
+            
+            # For other plans, use the existing logic
             accessible_trades = NotificationManager.get_accessible_trades(subscription.user, subscription)
             
             # Check if this trade is in user's accessible list
