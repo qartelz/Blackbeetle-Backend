@@ -1,7 +1,7 @@
 from channels.generic.websocket import AsyncWebsocketConsumer
 from asgiref.sync import sync_to_async
 from django.core.cache import cache
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 import json
 from decimal import Decimal
 import logging
@@ -64,6 +64,7 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
     
     RECONNECT_DELAY = 2   # Delay between reconnection attempts in seconds
     MAX_RETRIES = 3       # Maximum number of reconnection attempts
+    MESSAGE_DEDUPLICATION_TIMEOUT = 5  # Time window in seconds to deduplicate messages
 
     ERROR_MESSAGES = {
         4001: "No authentication token provided. Please log in and try again.",
@@ -91,6 +92,8 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
         self.connection_retries = 0
         self.user_group = None
         self._initial_data_task = None
+        # Store processed messages to avoid duplicates
+        self.processed_messages = set()
         # Trade limits based on plan type
         self.company_limits = {
             'BASIC': {
@@ -557,13 +560,30 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             await self.send_error(4006, str(e))
 
     async def trade_update(self, event):
-        """Handle trade update messages."""
+        """Handle trade update messages with deduplication."""
         if not self.is_connected or not self.subscription:
             return
 
         try:
             data = event["data"]
             trade_id = data["trade_id"]
+            trade_status = data.get("trade_status", "")
+            action = data.get("action", "updated")
+            timestamp = data.get("timestamp", timezone.now().isoformat())
+            
+            # Create a unique message identifier
+            message_id = f"{trade_id}:{trade_status}:{action}:{timestamp[:19]}"  # Truncate timestamp to seconds
+            
+            # Check if we've already processed this message recently
+            if message_id in self.processed_messages:
+                logger.info(f"Skipping duplicate message: {message_id}")
+                return
+                
+            # Add to processed messages
+            self.processed_messages.add(message_id)
+            
+            # Schedule cleanup of old message IDs
+            asyncio.create_task(self._cleanup_message_id(message_id))
             
             # Use cache for trade info
             cache_key = f"trade_info_{trade_id}"
@@ -605,6 +625,31 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
         except Exception as e:
             logger.error(f"Error handling trade update: {str(e)}")
             await self.send_error(4006, "Error processing trade update")
+
+    async def _cleanup_message_id(self, message_id):
+        """Remove message ID from processed set after timeout."""
+        await asyncio.sleep(self.MESSAGE_DEDUPLICATION_TIMEOUT)
+        if message_id in self.processed_messages:
+            self.processed_messages.remove(message_id)
+            
+    # Add a helper method to check for exact duplicate messages
+    def _is_duplicate_message(self, company_data):
+        """Check if this is a duplicate company update."""
+        cache_key = f"last_company_update_{self.user.id}_{company_data['id']}"
+        last_update = self.cache.get(cache_key)
+        
+        if last_update:
+            # Compare essential fields to determine if it's actually different
+            is_different = (
+                last_update.get('intraday_trade') != company_data.get('intraday_trade') or
+                last_update.get('positional_trade') != company_data.get('positional_trade')
+            )
+            if not is_different:
+                return True
+                
+        # Store the current update
+        self.cache.set(cache_key, company_data, 60)  # Cache for 1 minute
+        return False
 
     @db_sync_to_async
     def _get_trade_info(self, trade_id):

@@ -36,14 +36,12 @@ class GroupedTradeViewSet(viewsets.ReadOnlyModelViewSet):
         if user.is_staff:
             return base_queryset
             
-        # Check for active subscription
         current_subscription = user.subscriptions.filter(
             is_active=True,
             start_date__lte=current_date,
             end_date__gte=current_date
-        ).select_related('plan').first()
+        ).first()
 
-        # If no subscription, only show free trades
         if not current_subscription:
             free_trades = base_queryset.filter(trades__is_free_call=True)
             if not free_trades.exists():
@@ -53,19 +51,18 @@ class GroupedTradeViewSet(viewsets.ReadOnlyModelViewSet):
                 )
             return free_trades
 
-        # Get plan details
         plan_type = current_subscription.plan.name
         plan_filters = {
             'BASIC': ['BASIC'],
             'PREMIUM': ['BASIC', 'PREMIUM'],
-            'SUPER_PREMIUM': ['BASIC', 'PREMIUM', 'SUPER_PREMIUM'],
-            'FREE_TRIAL': ['BASIC', 'PREMIUM', 'SUPER_PREMIUM']  # Added FREE_TRIAL
+            'SUPER_PREMIUM': ['BASIC', 'PREMIUM', 'SUPER_PREMIUM']
         }
         
         allowed_plans = plan_filters.get(plan_type, [])
         
-        # Return companies with trades matching user's plan
         return base_queryset.filter(
+            # trades__created_at__date__gte=current_subscription.start_date,
+            # trades__created_at__date__lte=current_subscription.end_date,
             trades__status__in=['ACTIVE', 'COMPLETED']
         ).filter(
             Q(trades__plan_type__in=allowed_plans) |

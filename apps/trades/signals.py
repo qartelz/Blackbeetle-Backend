@@ -150,23 +150,51 @@ class TradeSignalHandler:
             return False
 
     @staticmethod
-    def broadcast_trade_update(trade: Trade, action: str = "updated"):
+    def process_trade_update(trade: Trade, action: str = "updated"):
+        """Unified method to handle trade updates - creates notification and sends WebSocket update"""
         try:
-            channel_layer = get_channel_layer()
-            trade_data = TradeUpdateManager.prepare_trade_data(trade, action)
-
             # Get all active subscriptions
             subscriptions = Subscription.objects.filter(
                 is_active=True,
                 end_date__gt=timezone.now()
             ).select_related('user', 'plan')
 
+            # Get channel layer for WebSocket communication
+            channel_layer = get_channel_layer()
+            
+            # Prepare trade data once
+            trade_data = TradeUpdateManager.prepare_trade_data(trade, action)
+            
+            # Process notification for each eligible user
+            created_notifications = set()
+
             for subscription in subscriptions:
+                user = subscription.user
+                
                 # Check if user should receive this update
-                if TradeSignalHandler.should_send_trade_update(subscription.user, trade, subscription):
-                    group_name = f"trade_updates_{subscription.user.id}"
+                if TradeSignalHandler.should_send_trade_update(user, trade, subscription):
+                    # Create unique key for this notification
+                    notification_key = f"{user.id}_{trade.id}_{trade.status}"
                     
-                    # Add subscription-specific data
+                    # Create notification if not already created
+                    if notification_key not in created_notifications:
+                        # Create notification in database
+                        message_type = "trade_completed" if trade.status == 'COMPLETED' else "trade_update"
+                        message = f"Trade {'completed' if trade.status == 'COMPLETED' else 'updated'}: {trade.company.trading_symbol}"
+                        
+                        TradeNotification.create_trade_notification(
+                            user=user,
+                            trade=trade,
+                            notification_type=TradeNotification.NotificationType.TRADE_COMPLETED if trade.status == 'COMPLETED' else TradeNotification.NotificationType.TRADE_UPDATE,
+                            message=message
+                        )
+                        
+                        created_notifications.add(notification_key)
+                    
+                    # Send WebSocket update
+                    group_name = f"trade_updates_{user.id}"
+                    
+                    # Customize message for this user if needed
                     user_trade_data = trade_data.copy()
                     if trade.status == 'COMPLETED':
                         user_trade_data['message_type'] = 'trade_completed'
@@ -178,65 +206,13 @@ class TradeSignalHandler:
                             "data": user_trade_data
                         }
                     )
-                    logger.info(f"Sent {trade.status} trade update to user {subscription.user.id} for trade {trade.id}")
-                else:
-                    logger.info(f"Skipped sending trade {trade.id} update to user {subscription.user.id} - not accessible")
-
-        except Exception as e:
-            logger.error(f"Error broadcasting trade update: {str(e)}")
-            logger.error(traceback.format_exc())
-
-    @staticmethod
-    def create_trade_notification(trade: Trade, action: str = "updated"):
-        try:
-            # Get all active subscriptions
-            subscriptions = Subscription.objects.filter(
-                is_active=True,
-                end_date__gt=timezone.now()
-            ).select_related('user', 'plan')
-
-            # Track created notifications to prevent duplicates
-            created_notifications = set()
-
-            for subscription in subscriptions:
-                if TradeSignalHandler.should_send_trade_update(subscription.user, trade, subscription):
-                    # Create a unique key for this notification
-                    notification_key = f"{subscription.user.id}_{trade.id}_{trade.status}"
                     
-                    # Only create if not already created
-                    if notification_key not in created_notifications:
-                        message_type = "trade_completed" if trade.status == 'COMPLETED' else "trade_update"
-                        message = f"Trade {'completed' if trade.status == 'COMPLETED' else 'updated'}: {trade.company.trading_symbol}"
-                        
-                        TradeNotification.create_trade_notification(
-                            user=subscription.user,
-                            trade=trade,
-                            notification_type=TradeNotification.NotificationType.TRADE_COMPLETED if trade.status == 'COMPLETED' else TradeNotification.NotificationType.TRADE_UPDATE,
-                            message=message
-                        )
-                        
-                        created_notifications.add(notification_key)
-                        
-                        # Send WebSocket update
-                        group_name = f"trade_updates_{subscription.user.id}"
-                        channel_layer = get_channel_layer()
-                        
-                        user_trade_data = TradeUpdateManager.prepare_trade_data(trade, action).copy()
-                        if trade.status == 'COMPLETED':
-                            user_trade_data['message_type'] = 'trade_completed'
-                            
-                        async_to_sync(channel_layer.group_send)(
-                            group_name,
-                            {
-                                "type": "trade_update",
-                                "data": user_trade_data
-                            }
-                        )
-                        
-                        logger.info(f"Sent {trade.status} trade update to user {subscription.user.id} for trade {trade.id}")
+                    logger.info(f"Sent {trade.status} trade update to user {user.id} for trade {trade.id}")
+                else:
+                    logger.info(f"Skipped sending trade {trade.id} update to user {user.id} - not accessible")
 
         except Exception as e:
-            logger.error(f"Error creating trade notification: {str(e)}")
+            logger.error(f"Error processing trade update: {str(e)}")
             logger.error(traceback.format_exc())
 
 
@@ -246,10 +222,10 @@ def handle_trade_update(sender, instance, created, **kwargs):
     try:
         action = "created" if created else "updated"
         
-        # Handle both ACTIVE and COMPLETED trades
+        # Process trade update if it's active or completed
         if instance.status in ['ACTIVE', 'COMPLETED']:
-            TradeSignalHandler.broadcast_trade_update(instance, action)
-            TradeSignalHandler.create_trade_notification(instance, action)
+            # Use the unified method instead of calling broadcast and notification separately
+            TradeSignalHandler.process_trade_update(instance, action)
             
             logger.info(f"Processed trade {instance.id} update - Status: {instance.status}, Action: {action}")
     except Exception as e:

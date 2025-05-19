@@ -245,12 +245,8 @@ class Trade(models.Model):
         # Save first
         super().save(*args, **kwargs)
         
-        # Only create notification if status has changed
-        if not is_new and old_status != self.status:
-            from .signals import TradeSignalHandler
-            TradeSignalHandler.broadcast_trade_update(self)
-        
-        # Do not create notification here - let the signal handler do it
+        # Remove direct call to broadcast_trade_update
+        # The post_save signal handler will handle all notifications and WebSocket updates
 
     @classmethod
     def get_available_trade_types(cls, company_token_id):
