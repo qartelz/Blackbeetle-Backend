@@ -1001,6 +1001,10 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 created_at__lt=subscription_start,
                 plan_type__in=plan_levels,
                 status__in=['ACTIVE', 'COMPLETED']
+            ).filter(
+                # Either still active OR completed after subscription started
+                models.Q(status='ACTIVE') | 
+                models.Q(status='COMPLETED', completed_at__gte=subscription_start)
             ).order_by('-created_at')[:6].values_list('id', flat=True)
             
             # Get new trades based on plan limits
