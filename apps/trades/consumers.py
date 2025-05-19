@@ -1031,14 +1031,9 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             return {'previous_trades': [], 'new_trades': []}
 
     async def _get_cached_or_fetch(self, cache_key, fetch_func):
-        """Generic cache wrapper for data fetching."""
-        cached_data = await sync_to_async(self.cache.get)(cache_key)
-        if cached_data is not None:
-            return cached_data
-
-        data = await fetch_func()
-        await sync_to_async(self.cache.set)(cache_key, data, self.cache_timeout)
-        return data
+        """Modified to skip cache and always fetch fresh data."""
+        # Skip caching entirely, always fetch fresh data
+        return await fetch_func()
 
     async def _get_subscription_info(self):
         """Get subscription information."""

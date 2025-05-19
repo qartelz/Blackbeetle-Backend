@@ -114,7 +114,7 @@ class TradeSignalHandler:
             previous_trades = TRADE_MODEL.objects.filter(
                 status__in=['ACTIVE', 'COMPLETED'],
                 created_at__lt=subscription.start_date,
-                status_changed_at__gte=subscription.start_date
+                updated_at__gte=subscription.start_date
             )
 
             # Combine both querysets

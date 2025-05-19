@@ -325,8 +325,9 @@ class Trade(models.Model):
 
         # Get previous trades (before subscription)
         previous_trades = base_query.filter(
+            status__in=['ACTIVE', 'COMPLETED'],
             created_at__lt=subscription_date,
-            status__in=[cls.Status.COMPLETED, cls.Status.CANCELLED]
+            updated_at__gte=subscription_date
         ).order_by('-created_at')
 
         # Apply subscription-based limits
