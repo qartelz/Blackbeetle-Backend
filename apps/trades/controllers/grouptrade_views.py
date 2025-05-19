@@ -17,7 +17,6 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import PermissionDenied
 from django_filters import rest_framework as filters
 from django.db.models import Q
-from django.utils import timezone
 
 class GroupedTradeViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Company.objects.filter(trades__isnull=False).distinct()
@@ -29,19 +28,21 @@ class GroupedTradeViewSet(viewsets.ReadOnlyModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        current_date = timezone.now().date()
+        current_datetime = timezone.now()  # Use datetime instead of date
         
         base_queryset = super().get_queryset()
         
         if user.is_staff:
             return base_queryset
             
+        # Get active subscription using datetime comparisons
         current_subscription = user.subscriptions.filter(
             is_active=True,
-            start_date__lte=current_date,
-            end_date__gte=current_date
+            start_date__lte=current_datetime,
+            end_date__gte=current_datetime
         ).first()
-
+        
+        # Handle users with no subscription
         if not current_subscription:
             free_trades = base_queryset.filter(trades__is_free_call=True)
             if not free_trades.exists():
@@ -51,20 +52,22 @@ class GroupedTradeViewSet(viewsets.ReadOnlyModelViewSet):
                 )
             return free_trades
 
+        # Process based on subscription plan
         plan_type = current_subscription.plan.name
         plan_filters = {
             'BASIC': ['BASIC'],
             'PREMIUM': ['BASIC', 'PREMIUM'],
-            'SUPER_PREMIUM': ['BASIC', 'PREMIUM', 'SUPER_PREMIUM']
+            'SUPER_PREMIUM': ['BASIC', 'PREMIUM', 'SUPER_PREMIUM'],
+            'FREE_TRIAL': ['BASIC', 'PREMIUM', 'SUPER_PREMIUM']  # Added FREE_TRIAL type
         }
         
         allowed_plans = plan_filters.get(plan_type, [])
         
-        return base_queryset.filter(
-            # trades__created_at__date__gte=current_subscription.start_date,
-            # trades__created_at__date__lte=current_subscription.end_date,
+        filtered_queryset = base_queryset.filter(
             trades__status__in=['ACTIVE', 'COMPLETED']
         ).filter(
             Q(trades__plan_type__in=allowed_plans) |
             Q(trades__is_free_call=True)
         ).distinct()
+        
+        return filtered_queryset
