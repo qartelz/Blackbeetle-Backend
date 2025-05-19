@@ -70,11 +70,8 @@ class TradeUpdateManager:
                 "image": trade.image.url if trade.image else None
             }
 
-            logger.info(f"Prepared trade data: {data}")
             return data
         except Exception as e:
-            logger.error(f"Error preparing trade data: {str(e)}")
-            logger.error(traceback.format_exc())
             return {
                 "trade_id": getattr(trade, 'id', 'unknown'),
                 "action": action,
@@ -94,9 +91,7 @@ class TradeSignalHandler:
                 created_at__gte=subscription.start_date
             ).count()
             return count
-        except Exception as e:
-            logger.error(f"Error getting active trade count: {str(e)}")
-            logger.error(traceback.format_exc())
+        except Exception:
             return 0
 
     @staticmethod
@@ -120,9 +115,7 @@ class TradeSignalHandler:
             # Combine both querysets
             accessible_trades = new_trades.union(previous_trades)
             return set(accessible_trades.values_list('id', flat=True))
-        except Exception as e:
-            logger.error(f"Error getting accessible trades: {str(e)}")
-            logger.error(traceback.format_exc())
+        except Exception:
             return set()
 
     @staticmethod
@@ -144,9 +137,7 @@ class TradeSignalHandler:
             accessible_trades = TradeSignalHandler.get_user_accessible_trades(user, subscription)
             return trade.id in accessible_trades
 
-        except Exception as e:
-            logger.error(f"Error checking trade update eligibility: {str(e)}")
-            logger.error(traceback.format_exc())
+        except Exception:
             return False
 
     @staticmethod
@@ -207,13 +198,8 @@ class TradeSignalHandler:
                         }
                     )
                     
-                    logger.info(f"Sent {trade.status} trade update to user {user.id} for trade {trade.id}")
-                else:
-                    logger.info(f"Skipped sending trade {trade.id} update to user {user.id} - not accessible")
-
-        except Exception as e:
-            logger.error(f"Error processing trade update: {str(e)}")
-            logger.error(traceback.format_exc())
+        except Exception:
+            pass
 
 
 @receiver(post_save, sender=Trade)
@@ -227,7 +213,5 @@ def handle_trade_update(sender, instance, created, **kwargs):
             # Use the unified method instead of calling broadcast and notification separately
             TradeSignalHandler.process_trade_update(instance, action)
             
-            logger.info(f"Processed trade {instance.id} update - Status: {instance.status}, Action: {action}")
-    except Exception as e:
-        logger.error(f"Error handling trade update signal: {str(e)}")
-        logger.error(traceback.format_exc())
+    except Exception:
+        pass

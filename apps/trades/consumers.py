@@ -543,7 +543,6 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
         """Send initial trade data to the client."""
         try:
             data = await self._get_filtered_company_data()
-            logger.info(f"Sending initial data with {len(data['stock_data'])} companies")
             
             await self.send(text_data=json.dumps({
                 'type': 'initial_data',
@@ -554,9 +553,8 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             await self.send_success("initial_data")
             
         except asyncio.CancelledError:
-            logger.debug("Initial data task cancelled")
+            pass
         except Exception as e:
-            logger.error(f"Error sending initial data: {str(e)}")
             await self.send_error(4006, str(e))
 
     async def trade_update(self, event):
@@ -576,7 +574,6 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             
             # Check if we've already processed this message recently
             if message_id in self.processed_messages:
-                logger.info(f"Skipping duplicate message: {message_id}")
                 return
                 
             # Add to processed messages
@@ -595,16 +592,20 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             if not trade_info:
                 return
 
-            # Check eligibility using cached accessible trades
-            accessible_trades = await self._get_cached_or_fetch(
-                f"accessible_trades_{self.user.id}_{self.subscription.id}",
-                self._get_accessible_trades
-            )
-
-            is_eligible = (
-                trade_id in accessible_trades['previous_trades'] or 
-                trade_id in accessible_trades['new_trades']
-            )
+            # Check eligibility - Special treatment for FREE_TRIAL and SUPER_PREMIUM
+            is_eligible = False
+            if self.subscription.plan.name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
+                is_eligible = True
+            else:
+                # Normal eligibility check for other plan types
+                accessible_trades = await self._get_cached_or_fetch(
+                    f"accessible_trades_{self.user.id}_{self.subscription.id}",
+                    self._get_accessible_trades
+                )
+                is_eligible = (
+                    trade_id in accessible_trades['previous_trades'] or 
+                    trade_id in accessible_trades['new_trades']
+                )
 
             if is_eligible:
                 # Get updated company data with caching
@@ -623,7 +624,6 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                     }, cls=DecimalEncoder))
 
         except Exception as e:
-            logger.error(f"Error handling trade update: {str(e)}")
             await self.send_error(4006, "Error processing trade update")
 
     async def _cleanup_message_id(self, message_id):

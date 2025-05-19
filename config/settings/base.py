@@ -44,6 +44,7 @@ INSTALLED_APPS = [
     # 'drf_yasg',
     'django_filters',
     'storages',
+    'stockreports',
     
     # 'cloudinary_storage',  # For Cloudinary storage
     # 'cloudinary',  
