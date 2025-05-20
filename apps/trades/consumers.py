@@ -135,6 +135,9 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 await self.close(code=4003)
                 return
 
+            # Clear any cached data from previous connections for this user
+            await self._clear_user_cache()
+            
             self.is_connected = True
             await self.send_success("connected")
             
@@ -542,7 +545,8 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
     async def send_initial_data(self):
         """Send initial trade data to the client."""
         try:
-            data = await self._get_filtered_company_data()
+            # Always get fresh data for initial load
+            data = await self._get_filtered_company_data() 
             
             await self.send(text_data=json.dumps({
                 'type': 'initial_data',
@@ -602,11 +606,8 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 )
 
             if is_eligible:
-                # Get updated company data with caching
-                company_data = await self._get_cached_or_fetch(
-                    f"company_{trade_id}",
-                    lambda: self._get_company_with_trade(trade_id)
-                )
+                # Always get fresh data for trade updates, bypassing cache
+                company_data = await self._get_company_with_trade(trade_id)
 
                 if company_data:
                     await self.send(text_data=json.dumps({
@@ -917,7 +918,8 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                     'timestamp': timezone.now().isoformat()
                 }))
             elif action == 'refresh':
-                # Client requested data refresh
+                # Client requested data refresh - clear cache and resend data
+                await self._clear_user_cache()
                 await self.send_initial_data()
             elif action == 'subscription_info':
                 # Send subscription info
@@ -1086,10 +1088,27 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             logger.error(traceback.format_exc())
             return {'previous_trades': [], 'new_trades': []}
 
-    async def _get_cached_or_fetch(self, cache_key, fetch_func):
-        """Modified to skip cache and always fetch fresh data."""
-        # Skip caching entirely, always fetch fresh data
-        return await fetch_func()
+    async def _get_cached_or_fetch(self, cache_key, fetch_func, timeout=60):
+        """Get data from cache or fetch it if not available, with a shorter timeout."""
+        try:
+            # Try to get from cache first
+            cached_data = await sync_to_async(cache.get)(cache_key)
+            if cached_data is not None:
+                return cached_data
+            
+            # If not in cache, fetch it
+            data = await fetch_func()
+            
+            # Only cache if we got data
+            if data:
+                # Use a short timeout to ensure data freshness
+                await sync_to_async(cache.set)(cache_key, data, timeout)
+            
+            return data
+        except Exception as e:
+            logger.error(f"Error in cached fetch: {str(e)}")
+            # If cache fails, try to fetch directly
+            return await fetch_func()
 
     async def _get_subscription_info(self):
         """Get subscription information."""
@@ -1112,6 +1131,29 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             'current': trade_counts,
             'remaining': remaining
         }
+
+    async def _clear_user_cache(self):
+        """Clear cached data for this user to ensure fresh data on reconnect."""
+        try:
+            user_id = getattr(self.user, 'id', 'unknown')
+            keys_to_delete = [
+                f"trade_counts_{user_id}*",
+                f"accessible_trades_{user_id}*",
+                f"company_data_{user_id}*",
+                f"last_company_update_{user_id}*"
+            ]
+            
+            for pattern in keys_to_delete:
+                # Find matching keys
+                matching_keys = await sync_to_async(self.cache.keys)(pattern)
+                
+                # Delete each key
+                for key in matching_keys:
+                    await sync_to_async(self.cache.delete)(key)
+                
+            logger.info(f"Cleared cache for user {user_id} on connect")
+        except Exception as e:
+            logger.error(f"Error clearing user cache: {str(e)}")
 
 
 class IndexUpdateManager:
