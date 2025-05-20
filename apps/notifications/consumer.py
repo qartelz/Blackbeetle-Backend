@@ -347,6 +347,7 @@ class NotificationConsumer(BaseConsumer):
         """Get user's unread notifications"""
         from .models import Notification
         from apps.subscriptions.models import Subscription
+        from apps.trades.models import Trade, Company
         
         try:
             # Check if user has a premium subscription
@@ -374,8 +375,24 @@ class NotificationConsumer(BaseConsumer):
                 # For regular users, limit to 50
                 notifications = notifications_query.order_by('-created_at')[:50]
             
-            return [
-                {
+            # Get all trade IDs from the notifications
+            trade_ids = [n.trade_id for n in notifications if n.trade_id]
+            
+            # Fetch all trades and companies in a single query to avoid N+1 problem
+            trades_info = {}
+            if trade_ids:
+                trades = Trade.objects.filter(id__in=trade_ids).select_related('company')
+                trades_info = {
+                    t.id: {
+                        'tradingSymbol': t.company.trading_symbol,
+                        'instrumentName': t.company.instrument_type
+                    } for t in trades
+                }
+            
+            # Process notifications with trading info
+            result = []
+            for notif in notifications:
+                notif_data = {
                     'id': str(notif.id),
                     'type': notif.notification_type,
                     'message_type': 'trade_completed' if notif.trade_status == 'COMPLETED' else 'trade_update',
@@ -388,8 +405,16 @@ class NotificationConsumer(BaseConsumer):
                     'is_redirectable': notif.is_redirectable,
                     'trade_data': notif.trade_data
                 }
-                for notif in notifications
-            ]
+                
+                # Add trading symbol and instrument name if available
+                if notif.trade_id and notif.trade_id in trades_info:
+                    trade_info = trades_info[notif.trade_id]
+                    notif_data['tradingSymbol'] = trade_info['tradingSymbol']
+                    notif_data['instrumentName'] = trade_info['instrumentName']
+                
+                result.append(notif_data)
+            
+            return result
         except Exception as e:
             logger.error(f"Error getting unread notifications: {str(e)}")
             return []
