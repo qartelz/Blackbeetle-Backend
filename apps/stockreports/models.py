@@ -4,7 +4,7 @@ class StockReport(models.Model):
     class Status(models.TextChoices):
         DRAFT = 'DRAFT', 'Draft'
         PUBLISHED = 'PUBLISHED', 'Published'
-        ARCHIVED = 'ARCHIVED', 'Archived'
+        EXPIRED = 'EXPIRED', 'Expired'
 
     class Strategy(models.TextChoices):
         POSITIONAL = 'POSITIONAL', 'Positional'
@@ -13,7 +13,7 @@ class StockReport(models.Model):
 
     title = models.CharField(max_length=255)
     date_created = models.DateTimeField(auto_now_add=True)
-    completed_at = models.DateTimeField(null=True, blank=True)
+    expired_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
     status = models.CharField(
         max_length=20,
