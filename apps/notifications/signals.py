@@ -183,18 +183,17 @@ class NotificationManager:
         
         eligible_users = []
         for subscription in active_subscriptions:
-            # SUPER_PREMIUM and FREE_TRIAL users should always be eligible
-            if subscription.plan.name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
-                eligible_users.append(subscription.user.id)
-                continue
-            
-            # For other plans, use the existing logic
+            # ALL plans should use the same logic for consistency
+            # Get accessible trades for this user based on their subscription plan
             accessible_trades = NotificationManager.get_accessible_trades(subscription.user, subscription)
             
-            # Check if this trade is in user's accessible list
+            # Only add user if this trade is in their accessible list
             if (trade.id in accessible_trades['previous_trades'] or 
                 trade.id in accessible_trades['new_trades']):
                 eligible_users.append(subscription.user.id)
+                logger.info(f"User {subscription.user.id} with {subscription.plan.name} plan is eligible for notification about trade {trade.id}")
+            else:
+                logger.info(f"User {subscription.user.id} with {subscription.plan.name} plan is NOT eligible for notification about trade {trade.id}")
         
         return eligible_users
 

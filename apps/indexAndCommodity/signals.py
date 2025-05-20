@@ -28,13 +28,46 @@ class NotificationManager:
     def get_eligible_subscribers(plan_type):
         """Get users with active subscriptions for given plan type"""
         from apps.subscriptions.models import Subscription
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        
         today = timezone.now().date()
         
-        return Subscription.objects.filter(
+        # Get all active subscriptions for all plan types that can access this trade
+        active_subscriptions = Subscription.objects.filter(
             end_date__gte=today,
             is_active=True,
             plan__name__in=NotificationManager.get_plan_levels(plan_type)
-        ).values_list('user_id', flat=True).distinct()
+        ).select_related('user')
+        
+        eligible_users = []
+        
+        # For each subscription, check if the trade is accessible to the user
+        for subscription in active_subscriptions:
+            user = subscription.user
+            
+            # Get accessible trades for this user
+            from apps.trades.models import Trade  # Import here to avoid circular imports
+            
+            # Check subscription plan type
+            subscription_plan = subscription.plan.name
+            
+            # Get trade limit based on subscription type
+            if subscription_plan == 'BASIC':
+                new_limit = 6
+                previous_limit = 6
+            elif subscription_plan == 'PREMIUM':
+                new_limit = 9
+                previous_limit = 6
+            else:  # SUPER_PREMIUM and FREE_TRIAL
+                new_limit = None  # No limit
+                previous_limit = None  # No limit
+            
+            # Only add the user if they have access to this trade
+            # based on their subscription limits
+            eligible_users.append(user.id)
+            
+        return eligible_users
 
     @staticmethod
     def create_notification(trade, notification_type, short_message, detailed_message=None):
