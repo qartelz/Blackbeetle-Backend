@@ -121,14 +121,18 @@ class NotificationManager:
         
         # Special handling for SUPER_PREMIUM and FREE_TRIAL users
         if plan_name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
-            # Get all trades regardless of when they were created
+            # Only get trades that are truly accessible based on subscription timeframe
+            # instead of returning ALL trades unconditionally
             all_trades = Trade.objects.filter(
                 status__in=['ACTIVE', 'COMPLETED']
-            ).values_list('id', flat=True)
+            )
+            
+            # Filter trades to only include those that are accessible according to model logic
+            accessible_trades = [t.id for t in all_trades if t.is_trade_accessible(user, subscription)]
             
             return {
-                'previous_trades': list(all_trades),
-                'new_trades': list(all_trades)
+                'previous_trades': accessible_trades,
+                'new_trades': accessible_trades
             }
         
         # Normal handling for other subscription types - keep the existing logic
@@ -183,18 +187,10 @@ class NotificationManager:
         
         eligible_users = []
         for subscription in active_subscriptions:
-            # SUPER_PREMIUM and FREE_TRIAL users should always be eligible
-            if subscription.plan.name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
+            # Use the trade model's method to determine accessibility directly
+            if trade.is_trade_accessible(subscription.user, subscription):
                 eligible_users.append(subscription.user.id)
                 continue
-            
-            # For other plans, use the existing logic
-            accessible_trades = NotificationManager.get_accessible_trades(subscription.user, subscription)
-            
-            # Check if this trade is in user's accessible list
-            if (trade.id in accessible_trades['previous_trades'] or 
-                trade.id in accessible_trades['new_trades']):
-                eligible_users.append(subscription.user.id)
         
         return eligible_users
 

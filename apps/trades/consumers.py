@@ -305,34 +305,27 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             plan_levels = self.trade_manager.get_plan_levels(plan_name)
             subscription_start = self.subscription.start_date
 
-            # Get NEW trades - created after subscription start
-            # Order by created_at (oldest first) and take only the first N based on plan
-            new_trades_query = Trade.objects.filter(
+            # Get counts of unique companies with trades
+            # For new trades (after subscription start)
+            new_companies = Trade.objects.filter(
                 plan_type__in=plan_levels,
                 status__in=['ACTIVE', 'COMPLETED'],
                 created_at__gte=subscription_start
-            ).order_by('created_at')
+            ).values('company').distinct().count()
             
-            # Apply plan limits to query before getting unique companies
-            if plan_name == 'BASIC':
-                new_trades_query = new_trades_query[:6]
-            elif plan_name == 'PREMIUM':
-                new_trades_query = new_trades_query[:9]
-                
-            # Get unique companies from the limited trades query
-            new_companies = len(set(new_trades_query.values_list('company', flat=True)))
-            
-            # For PREVIOUS trades - created before subscription but still relevant
-            # (either active at subscription time or completed after subscription)
+            # For previous trades (before subscription)
             previous_companies = Trade.objects.filter(
                 plan_type__in=plan_levels,
                 status__in=['ACTIVE', 'COMPLETED'],
                 created_at__lt=subscription_start
-            ).filter(
-                Q(status='ACTIVE') | 
-                Q(completed_at__gte=subscription_start)
             ).values('company').distinct().count()
             
+            # Apply plan limits
+            if plan_name == 'BASIC':
+                new_companies = min(new_companies, 6)
+            elif plan_name == 'PREMIUM':
+                new_companies = min(new_companies, 9)
+                
             # Previous trades are always capped at 6
             previous_companies = min(previous_companies, 6)
             
@@ -348,66 +341,6 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
 
         except Exception as e:
             logger.error(f"Error getting trade counts: {str(e)}")
-            return {'new': 0, 'previous': 0, 'total': 0}
-            
-    def _get_trade_counts_sync(self):
-        """Synchronous version of _get_trade_counts for use within sync methods."""
-        try:
-            from apps.trades.models import Trade
-            from django.db.models import Q
-            
-            # Get plan type
-            plan_name = self.subscription.plan.name
-            plan_levels = self.trade_manager.get_plan_levels(plan_name)
-            
-            # Get subscription dates
-            subscription_start = self.subscription.start_date
-            
-            # Get NEW trades - created after subscription start
-            # Order by created_at (oldest first) and take only the first N based on plan
-            new_trades_query = Trade.objects.filter(
-                plan_type__in=plan_levels,
-                status__in=['ACTIVE', 'COMPLETED'],
-                created_at__gte=subscription_start
-            ).order_by('created_at')
-            
-            # Apply plan limits to query before getting unique companies
-            if plan_name == 'BASIC':
-                new_trades_query = new_trades_query[:6]
-            elif plan_name == 'PREMIUM':
-                new_trades_query = new_trades_query[:9]
-                
-            # Get unique companies from the limited trades query
-            new_companies = len(set(new_trades_query.values_list('company', flat=True)))
-            
-            # For PREVIOUS trades - created before subscription but still relevant
-            # (either active at subscription time or completed after subscription)
-            previous_companies = Trade.objects.filter(
-                plan_type__in=plan_levels,
-                status__in=['ACTIVE', 'COMPLETED'],
-                created_at__lt=subscription_start
-            ).filter(
-                Q(status='ACTIVE') | 
-                Q(completed_at__gte=subscription_start)
-            ).values('company').distinct().count()
-            
-            # Previous trades are always capped at 6
-            previous_companies = min(previous_companies, 6)
-            
-            counts = {
-                'new': new_companies,
-                'previous': previous_companies,
-                'total': new_companies + previous_companies
-            }
-            
-            logger.info(f"Final counts for user {self.user.id}: {counts}")
-            
-            return counts
-            
-        except Exception as e:
-            logger.error(f"Error getting trade counts sync: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
             return {'new': 0, 'previous': 0, 'total': 0}
 
     async def disconnect(self, close_code):
@@ -502,42 +435,30 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
 
                     # Categorize based on trade dates
                     if company.earliest_trade_date >= subscription_start:
-                        # New trades - created after subscription start
                         new_companies_data.append(company_data)
                     else:
-                        # Previous trades - check if they were active at subscription time
-                        # or completed after subscription
-                        is_relevant_previous = False
-                        for trade in company.filtered_trades:
-                            if (trade.created_at < subscription_start and 
-                                (trade.status == 'ACTIVE' or 
-                                 (trade.completed_at and trade.completed_at >= subscription_start))):
-                                is_relevant_previous = True
-                                break
-                                
-                        if is_relevant_previous:
-                            previous_companies_data.append(company_data)
+                        previous_companies_data.append(company_data)
 
                 # Apply limits based on plan type
-                # For previous trades: newest first, limited to 6
+                # Always sort by created_at in descending order (newest first) for better UX
                 previous_companies_data = sorted(
                     previous_companies_data,
                     key=lambda x: x['created_at'] if x['created_at'] else '',
-                    reverse=True  # Newest first for previous trades
-                )[:6]
-                
-                # For new trades: OLDEST first (chronological order), limited by plan
+                    reverse=True
+                )
                 new_companies_data = sorted(
                     new_companies_data,
                     key=lambda x: x['created_at'] if x['created_at'] else '',
-                    reverse=False  # Oldest first for new trades - chronological order
+                    reverse=True  # Newest first
                 )
-                
+
                 # Apply plan-specific limits
                 if plan_name == 'BASIC':
-                    new_companies_data = new_companies_data[:6]  # First 6 oldest new trades
+                    previous_companies_data = previous_companies_data[:6]  # Limit to 6 previous
+                    new_companies_data = new_companies_data[:6]  # Limit to 6 new
                 elif plan_name == 'PREMIUM':
-                    new_companies_data = new_companies_data[:9]  # First 9 oldest new trades
+                    previous_companies_data = previous_companies_data[:6]  # Limit to 6 previous
+                    new_companies_data = new_companies_data[:9]  # Limit to 9 new
                 # SUPER_PREMIUM and FREE_TRIAL have no limits
 
                 # Get accurate trade counts from DB for consistency
@@ -932,6 +853,195 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             logger.error(traceback.format_exc())
             return False
 
+    def _get_trade_counts_sync(self):
+        """Synchronous version of _get_trade_counts for use within sync methods."""
+        try:
+            from apps.trades.models import Trade
+            from django.db import models
+            
+            # Get plan type
+            plan_name = self.subscription.plan.name
+            plan_levels = self.trade_manager.get_plan_levels(plan_name)
+            
+            # Get subscription dates
+            subscription_start = self.subscription.start_date
+            
+            # Get counts of unique companies with trades
+            # For new trades (after subscription start)
+            new_companies = Trade.objects.filter(
+                plan_type__in=plan_levels,
+                status__in=['ACTIVE', 'COMPLETED'],
+                created_at__gte=subscription_start
+            ).values('company').distinct().count()
+            
+            # For previous trades (before subscription)
+            previous_companies = Trade.objects.filter(
+                plan_type__in=plan_levels,
+                status__in=['ACTIVE', 'COMPLETED'],
+                created_at__lt=subscription_start
+            ).values('company').distinct().count()
+            
+            # Apply plan limits
+            if plan_name == 'BASIC':
+                new_companies = min(new_companies, 6)
+            elif plan_name == 'PREMIUM':
+                new_companies = min(new_companies, 9)
+                
+            # Previous trades are always capped at 6
+            previous_companies = min(previous_companies, 6)
+            
+            counts = {
+                'new': new_companies,
+                'previous': previous_companies,
+                'total': new_companies + previous_companies
+            }
+            
+            logger.info(f"Final counts for user {self.user.id}: {counts}")
+            
+            return counts
+            
+        except Exception as e:
+            logger.error(f"Error getting trade counts sync: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {'new': 0, 'previous': 0, 'total': 0}
+
+    async def receive(self, text_data):
+        """Handle messages sent from the WebSocket client."""
+        try:
+            data = json.loads(text_data)
+            action = data.get('action')
+            
+            if action == 'ping':
+                # Simple keepalive mechanism
+                await self.send(text_data=json.dumps({
+                    'type': 'pong',
+                    'timestamp': timezone.now().isoformat()
+                }))
+            elif action == 'refresh':
+                # Client requested data refresh - clear cache and resend data
+                logger.info(f"User {self.user.id} requested data refresh")
+                await self._clear_user_cache()
+                try:
+                    # Get fresh data and bypass cache
+                    data = await self._get_filtered_company_data(bypass_cache=True)
+                    
+                    await self.send(text_data=json.dumps({
+                        'type': 'initial_data',
+                        'stock_data': data['stock_data'],
+                        'index_data': data['index_data']
+                    }, cls=DecimalEncoder))
+                    
+                    await self.send_success("refresh_complete")
+                except Exception as e:
+                    logger.error(f"Error processing refresh: {str(e)}")
+                    await self.send_error(4006, "Failed to refresh data")
+            elif action == 'subscription_info':
+                # Send subscription info
+                trade_counts = await self._get_trade_counts()
+                plan_name = self.subscription.plan.name
+                limits = self.company_limits.get(plan_name, {'new': None, 'previous': None, 'total': None})
+                
+                # Calculate remaining trades
+                remaining = {
+                    'new': None if limits['new'] is None else max(0, limits['new'] - trade_counts['new']),
+                    'previous': None if limits['previous'] is None else max(0, limits['previous'] - trade_counts['previous']),
+                    'total': None if limits['total'] is None else max(0, limits['total'] - trade_counts['total'])
+                }
+                
+                await self.send(text_data=json.dumps({
+                    'type': 'subscription_info',
+                    'data': {
+                        'plan': plan_name,
+                        'start_date': self.subscription.start_date.isoformat(),
+                        'end_date': self.subscription.end_date.isoformat(),
+                        'limits': limits,
+                        'current': trade_counts,
+                        'remaining': remaining
+                    }
+                }))
+            else:
+                logger.warning(f"Unknown action received: {action}")
+                await self.send(text_data=json.dumps({
+                    'type': 'error',
+                    'message': f"Unknown action: {action}"
+                }))
+        except json.JSONDecodeError:
+            logger.error("Invalid JSON received")
+            await self.send(text_data=json.dumps({
+                'type': 'error',
+                'message': "Invalid JSON format"
+            }))
+        except Exception as e:
+            logger.error(f"Error handling message: {str(e)}")
+            await self.send(text_data=json.dumps({
+                'type': 'error',
+                'message': "Error processing your request"
+            }))
+
+    async def system_notification(self, event):
+        """Handle system notifications to be sent to the client."""
+        if not self.is_connected:
+            return
+            
+        try:
+            message = event.get('message')
+            notification_type = event.get('notification_type', 'info')
+            
+            await self.send(text_data=json.dumps({
+                'type': 'system_notification',
+                'notification_type': notification_type,
+                'message': message
+            }))
+        except Exception as e:
+            logger.error(f"Error sending system notification: {str(e)}")
+
+    def _can_get_new_trade(self, company_id):
+        """Check if user can get a new trade for a company."""
+        try:
+            from apps.trades.models import Trade
+            from django.db import models
+            
+            # Get plan type
+            plan_name = self.subscription.plan.name
+            plan_levels = self.trade_manager.get_plan_levels(plan_name)
+            
+            # Get subscription dates
+            subscription_start = self.subscription.start_date
+            subscription_end = self.subscription.end_date
+            
+            # Check if company already has a trade
+            existing_trade = Trade.objects.filter(
+                company_id=company_id,
+                plan_type__in=plan_levels
+            ).order_by('-created_at').first()
+            
+            if existing_trade:
+                logger.info(f"Company {company_id} already has a trade: {existing_trade.id}")
+                return False
+            
+            # Get trade counts
+            counts = self._get_trade_counts_sync()
+            
+            # Check if user has reached their limit
+            if plan_name == 'BASIC':
+                if counts['total'] >= 6:  # BASIC: Only 6 newest trades
+                    logger.info(f"User {self.user.id} has reached BASIC plan limit of 6 trades")
+                    return False
+            elif plan_name == 'PREMIUM':
+                if counts['total'] >= 9:  # PREMIUM: Only 9 newest trades
+                    logger.info(f"User {self.user.id} has reached PREMIUM plan limit of 9 trades")
+                    return False
+            # SUPER_PREMIUM and FREE_TRIAL have no limits
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error checking if user can get new trade: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
     @db_sync_to_async
     def _get_accessible_trades(self):
         """Get the list of trade IDs that this user has access to."""
@@ -1057,142 +1167,6 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
         except Exception as e:
             logger.error(f"Error clearing user cache: {str(e)}")
             logger.error(traceback.format_exc())
-
-    def _can_get_new_trade(self, company_id):
-        """Check if user can get a new trade for a company."""
-        try:
-            from apps.trades.models import Trade
-            from django.db import models
-            
-            # Get plan type
-            plan_name = self.subscription.plan.name
-            plan_levels = self.trade_manager.get_plan_levels(plan_name)
-            
-            # Get subscription dates
-            subscription_start = self.subscription.start_date
-            subscription_end = self.subscription.end_date
-            
-            # Check if company already has a trade
-            existing_trade = Trade.objects.filter(
-                company_id=company_id,
-                plan_type__in=plan_levels
-            ).order_by('-created_at').first()
-            
-            if existing_trade:
-                logger.info(f"Company {company_id} already has a trade: {existing_trade.id}")
-                return False
-            
-            # Get trade counts
-            counts = self._get_trade_counts_sync()
-            
-            # Check if user has reached their limit
-            if plan_name == 'BASIC':
-                if counts['total'] >= 6:  # BASIC: Only 6 newest trades
-                    logger.info(f"User {self.user.id} has reached BASIC plan limit of 6 trades")
-                    return False
-            elif plan_name == 'PREMIUM':
-                if counts['total'] >= 9:  # PREMIUM: Only 9 newest trades
-                    logger.info(f"User {self.user.id} has reached PREMIUM plan limit of 9 trades")
-                    return False
-            # SUPER_PREMIUM and FREE_TRIAL have no limits
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error checking if user can get new trade: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return False
-
-    async def receive(self, text_data):
-        """Handle messages sent from the WebSocket client."""
-        try:
-            data = json.loads(text_data)
-            action = data.get('action')
-            
-            if action == 'ping':
-                # Simple keepalive mechanism
-                await self.send(text_data=json.dumps({
-                    'type': 'pong',
-                    'timestamp': timezone.now().isoformat()
-                }))
-            elif action == 'refresh':
-                # Client requested data refresh - clear cache and resend data
-                logger.info(f"User {self.user.id} requested data refresh")
-                await self._clear_user_cache()
-                try:
-                    # Get fresh data and bypass cache
-                    data = await self._get_filtered_company_data(bypass_cache=True)
-                    
-                    await self.send(text_data=json.dumps({
-                        'type': 'initial_data',
-                        'stock_data': data['stock_data'],
-                        'index_data': data['index_data']
-                    }, cls=DecimalEncoder))
-                    
-                    await self.send_success("refresh_complete")
-                except Exception as e:
-                    logger.error(f"Error processing refresh: {str(e)}")
-                    await self.send_error(4006, "Failed to refresh data")
-            elif action == 'subscription_info':
-                # Send subscription info
-                trade_counts = await self._get_trade_counts()
-                plan_name = self.subscription.plan.name
-                limits = self.company_limits.get(plan_name, {'new': None, 'previous': None, 'total': None})
-                
-                # Calculate remaining trades
-                remaining = {
-                    'new': None if limits['new'] is None else max(0, limits['new'] - trade_counts['new']),
-                    'previous': None if limits['previous'] is None else max(0, limits['previous'] - trade_counts['previous']),
-                    'total': None if limits['total'] is None else max(0, limits['total'] - trade_counts['total'])
-                }
-                
-                await self.send(text_data=json.dumps({
-                    'type': 'subscription_info',
-                    'data': {
-                        'plan': plan_name,
-                        'start_date': self.subscription.start_date.isoformat(),
-                        'end_date': self.subscription.end_date.isoformat(),
-                        'limits': limits,
-                        'current': trade_counts,
-                        'remaining': remaining
-                    }
-                }))
-            else:
-                logger.warning(f"Unknown action received: {action}")
-                await self.send(text_data=json.dumps({
-                    'type': 'error',
-                    'message': f"Unknown action: {action}"
-                }))
-        except json.JSONDecodeError:
-            logger.error("Invalid JSON received")
-            await self.send(text_data=json.dumps({
-                'type': 'error',
-                'message': "Invalid JSON format"
-            }))
-        except Exception as e:
-            logger.error(f"Error handling message: {str(e)}")
-            await self.send(text_data=json.dumps({
-                'type': 'error',
-                'message': "Error processing your request"
-            }))
-
-    async def system_notification(self, event):
-        """Handle system notifications to be sent to the client."""
-        if not self.is_connected:
-            return
-            
-        try:
-            message = event.get('message')
-            notification_type = event.get('notification_type', 'info')
-            
-            await self.send(text_data=json.dumps({
-                'type': 'system_notification',
-                'notification_type': notification_type,
-                'message': message
-            }))
-        except Exception as e:
-            logger.error(f"Error sending system notification: {str(e)}")
 
 
 class IndexUpdateManager:
