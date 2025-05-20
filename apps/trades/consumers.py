@@ -30,7 +30,7 @@ class DecimalEncoder(json.JSONEncoder):
 class TradeUpdateManager:
     """Utility class for managing trade caching and plan level access."""
     
-    CACHE_TIMEOUT = 3600  # Cache duration in seconds (1 hour)
+    CACHE_TIMEOUT = 300  # Cache duration in seconds (5 minutes instead of 1 hour)
 
     @staticmethod
     async def get_cached_trades(cache_key: str) -> Optional[Dict]:
@@ -79,7 +79,8 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
     SUCCESS_MESSAGES = {
         "connected": "Successfully connected to trade updates.",
         "initial_data": "Initial trade data loaded successfully.",
-        "trade_update": "Trade update received successfully."
+        "trade_update": "Trade update received successfully.",
+        "refresh_complete": "Data refresh completed successfully."
     }
 
     def __init__(self, *args, **kwargs):
@@ -340,14 +341,15 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             await self.close()
 
     @db_sync_to_async
-    def _get_filtered_company_data(self):
+    def _get_filtered_company_data(self, bypass_cache=False):
         """Get filtered company data based on subscription plan and start date."""
         from apps.trades.models import Trade, Company
         from django.db.models import Prefetch, Q, Max, Min, OuterRef, Subquery
         
         cache_key = f"company_data_{self.user.id}_{self.subscription.id}"
-        cached_data = cache.get(cache_key)
-        if cached_data:
+        cached_data = None if bypass_cache else cache.get(cache_key)
+        if cached_data and not bypass_cache:
+            logger.info(f"Using cached company data for user {self.user.id}")
             return cached_data
         
         try:
@@ -421,23 +423,27 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                     else:
                         previous_companies_data.append(company_data)
 
-                # Apply limits
+                # Apply limits based on plan type
+                # Always sort by created_at in descending order (newest first) for better UX
                 previous_companies_data = sorted(
                     previous_companies_data,
                     key=lambda x: x['created_at'] if x['created_at'] else '',
                     reverse=True
-                )[:6]
+                )
+                new_companies_data = sorted(
+                    new_companies_data,
+                    key=lambda x: x['created_at'] if x['created_at'] else '',
+                    reverse=True  # Newest first
+                )
 
+                # Apply plan-specific limits
                 if plan_name == 'BASIC':
-                    new_companies_data = sorted(
-                        new_companies_data,
-                        key=lambda x: x['created_at'] if x['created_at'] else ''
-                    )[:6]
+                    previous_companies_data = previous_companies_data[:6]  # Limit to 6 previous
+                    new_companies_data = new_companies_data[:6]  # Limit to 6 new
                 elif plan_name == 'PREMIUM':
-                    new_companies_data = sorted(
-                        new_companies_data,
-                        key=lambda x: x['created_at'] if x['created_at'] else ''
-                    )[:9]
+                    previous_companies_data = previous_companies_data[:6]  # Limit to 6 previous
+                    new_companies_data = new_companies_data[:9]  # Limit to 9 new
+                # SUPER_PREMIUM and FREE_TRIAL have no limits
 
                 result = {
                     'stock_data': new_companies_data + previous_companies_data,
@@ -545,8 +551,11 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
     async def send_initial_data(self):
         """Send initial trade data to the client."""
         try:
+            # Clear cache first to ensure fresh data
+            await self._clear_user_cache()
+            
             # Always get fresh data for initial load
-            data = await self._get_filtered_company_data() 
+            data = await self._get_filtered_company_data(bypass_cache=True) 
             
             await self.send(text_data=json.dumps({
                 'type': 'initial_data',
@@ -559,6 +568,8 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
         except asyncio.CancelledError:
             pass
         except Exception as e:
+            logger.error(f"Error in send_initial_data: {str(e)}")
+            logger.error(traceback.format_exc())
             await self.send_error(4006, str(e))
 
     async def trade_update(self, event):
@@ -919,8 +930,22 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 }))
             elif action == 'refresh':
                 # Client requested data refresh - clear cache and resend data
+                logger.info(f"User {self.user.id} requested data refresh")
                 await self._clear_user_cache()
-                await self.send_initial_data()
+                try:
+                    # Get fresh data and bypass cache
+                    data = await self._get_filtered_company_data(bypass_cache=True)
+                    
+                    await self.send(text_data=json.dumps({
+                        'type': 'initial_data',
+                        'stock_data': data['stock_data'],
+                        'index_data': data['index_data']
+                    }, cls=DecimalEncoder))
+                    
+                    await self.send_success("refresh_complete")
+                except Exception as e:
+                    logger.error(f"Error processing refresh: {str(e)}")
+                    await self.send_error(4006, "Failed to refresh data")
             elif action == 'subscription_info':
                 # Send subscription info
                 trade_counts = await self._get_trade_counts()
@@ -1136,24 +1161,22 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
         """Clear cached data for this user to ensure fresh data on reconnect."""
         try:
             user_id = getattr(self.user, 'id', 'unknown')
-            keys_to_delete = [
-                f"trade_counts_{user_id}*",
-                f"accessible_trades_{user_id}*",
-                f"company_data_{user_id}*",
-                f"last_company_update_{user_id}*"
+            subscription_id = getattr(self.subscription, 'id', 'unknown')
+            
+            # Keys that need to be cleared
+            keys_to_clear = [
+                f"trade_counts_{user_id}_{subscription_id}",
+                f"company_data_{user_id}_{subscription_id}",
+                f"last_company_update_{user_id}_*"
             ]
             
-            for pattern in keys_to_delete:
-                # Find matching keys
-                matching_keys = await sync_to_async(self.cache.keys)(pattern)
+            for key in keys_to_clear:
+                await sync_to_async(cache.delete)(key)
                 
-                # Delete each key
-                for key in matching_keys:
-                    await sync_to_async(self.cache.delete)(key)
-                
-            logger.info(f"Cleared cache for user {user_id} on connect")
+            logger.info(f"Cleared cache for user {user_id} with subscription {subscription_id}")
         except Exception as e:
             logger.error(f"Error clearing user cache: {str(e)}")
+            logger.error(traceback.format_exc())
 
 
 class IndexUpdateManager:
