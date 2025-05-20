@@ -371,10 +371,15 @@ class Trade(models.Model):
                 ).first()
                 
             if not subscription:
-                return False
+                # No subscription - only free trades accessible
+                return self.is_free_call
                 
             # SUPER_PREMIUM and FREE_TRIAL get access to all trades
             if subscription.plan.name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
+                return True
+                
+            # Free calls are accessible to everyone
+            if self.is_free_call:
                 return True
                 
             # For other plans, check if trade is in their allowed plan types
@@ -390,44 +395,38 @@ class Trade(models.Model):
             if self.created_at >= subscription.start_date:
                 # Check limits based on plan type
                 if subscription.plan.name == 'BASIC':
-                    # Get count of new trades for this user (up to 6)
-                    new_trade_count = Trade.objects.filter(
+                    # Get new trades for this user (up to 6)
+                    new_trades = Trade.objects.filter(
                         status__in=['ACTIVE', 'COMPLETED'],
                         created_at__gte=subscription.start_date,
                         plan_type__in=['BASIC']
-                    ).count()
-                    # Check if within limit or this is already one of their trades
-                    return new_trade_count <= 6 or self in Trade.objects.filter(
-                        status__in=['ACTIVE', 'COMPLETED'],
-                        created_at__gte=subscription.start_date,
-                        plan_type__in=['BASIC']
-                    )[:6]
+                    ).order_by('created_at')[:6]
+                    
+                    # Check if this trade is in the set
+                    return self.id in [t.id for t in new_trades]
+                    
                 elif subscription.plan.name == 'PREMIUM':
-                    # Get count of new trades for this user (up to 9)
-                    new_trade_count = Trade.objects.filter(
+                    # Get new trades for this user (up to 9)
+                    new_trades = Trade.objects.filter(
                         status__in=['ACTIVE', 'COMPLETED'],
                         created_at__gte=subscription.start_date,
                         plan_type__in=['BASIC', 'PREMIUM']
-                    ).count()
-                    # Check if within limit or this is already one of their trades
-                    return new_trade_count <= 9 or self in Trade.objects.filter(
-                        status__in=['ACTIVE', 'COMPLETED'],
-                        created_at__gte=subscription.start_date,
-                        plan_type__in=['BASIC', 'PREMIUM']
-                    )[:9]
+                    ).order_by('created_at')[:9]
+                    
+                    # Check if this trade is in the set
+                    return self.id in [t.id for t in new_trades]
                     
             # Check if trade was active at subscription time (previous trade)
-            elif self.created_at < subscription.start_date and self.status == 'ACTIVE':
+            elif self.created_at < subscription.start_date:
                 # All plans get up to 6 previous trades
-                previous_trade_count = Trade.objects.filter(
+                previous_trades = Trade.objects.filter(
                     status__in=['ACTIVE', 'COMPLETED'],
-                    created_at__lt=subscription.start_date
-                ).count()
-                # Check if within limit or this is already one of their trades
-                return previous_trade_count <= 6 or self in Trade.objects.filter(
-                    status__in=['ACTIVE', 'COMPLETED'],
-                    created_at__lt=subscription.start_date
-                )[:6]
+                    created_at__lt=subscription.start_date,
+                    plan_type__in=allowed_plan_types
+                ).order_by('-created_at')[:6]
+                
+                # Check if this trade is in the set
+                return self.id in [t.id for t in previous_trades]
                 
             # Not a new or previous trade, no access
             return False

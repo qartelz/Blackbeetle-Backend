@@ -576,32 +576,26 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             if message_id in self.processed_messages:
                 return
                 
+            # Skip PENDING trades
+            if trade_status == 'PENDING':
+                return
+                
             # Add to processed messages
             self.processed_messages.add(message_id)
             
             # Schedule cleanup of old message IDs
             asyncio.create_task(self._cleanup_message_id(message_id))
             
-            # Use cache for trade info
-            cache_key = f"trade_info_{trade_id}"
-            trade_info = await self._get_cached_or_fetch(
-                cache_key,
-                lambda: self._get_trade_info(trade_id)
-            )
-            
-            if not trade_info:
-                return
-
-            # Check eligibility - Special treatment for FREE_TRIAL and SUPER_PREMIUM
+            # Check eligibility for this trade update
             is_eligible = False
-            if self.subscription.plan.name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
+            plan_name = self.subscription.plan.name
+            
+            # Special handling for SUPER_PREMIUM and FREE_TRIAL
+            if plan_name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
                 is_eligible = True
             else:
-                # Normal eligibility check for other plan types
-                accessible_trades = await self._get_cached_or_fetch(
-                    f"accessible_trades_{self.user.id}_{self.subscription.id}",
-                    self._get_accessible_trades
-                )
+                # For BASIC and PREMIUM, check accessible trades
+                accessible_trades = await self._get_accessible_trades()
                 is_eligible = (
                     trade_id in accessible_trades['previous_trades'] or 
                     trade_id in accessible_trades['new_trades']
@@ -624,7 +618,8 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                     }, cls=DecimalEncoder))
 
         except Exception as e:
-            await self.send_error(4006, "Error processing trade update")
+            logger.error(f"Error processing trade update: {str(e)}")
+            logger.error(traceback.format_exc())
 
     async def _cleanup_message_id(self, message_id):
         """Remove message ID from processed set after timeout."""
@@ -1034,40 +1029,52 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
     def _get_accessible_trades(self):
         """Get the list of trade IDs that this user has access to."""
         try:
-            from apps.trades.models import Trade
+            from .models import Trade
             
             # Get subscription details
             subscription_start = self.subscription.start_date
             plan_name = self.subscription.plan.name
-            plan_levels = self.trade_manager.get_plan_levels(plan_name)
             
-            # Get previous trades (fixed set of 6)
+            # For SUPER_PREMIUM and FREE_TRIAL - return all trades
+            if plan_name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
+                all_trades = Trade.objects.filter(
+                    status__in=['ACTIVE', 'COMPLETED']
+                ).values_list('id', flat=True)
+                return {
+                    'previous_trades': list(all_trades),
+                    'new_trades': list(all_trades)
+                }
+            
+            # For other plans, define allowed plan types
+            plan_filters = {
+                'BASIC': ['BASIC'],
+                'PREMIUM': ['BASIC', 'PREMIUM'],
+            }
+            allowed_plans = plan_filters.get(plan_name, [])
+            
+            # Get previous trades (created before subscription)
             previous_trades = Trade.objects.filter(
                 created_at__lt=subscription_start,
-                plan_type__in=plan_levels,
+                plan_type__in=allowed_plans,
                 status__in=['ACTIVE', 'COMPLETED']
-            ).filter(
-                # Either still active OR completed after subscription started
-                models.Q(status='ACTIVE') | 
-                models.Q(status='COMPLETED', completed_at__gte=subscription_start)
             ).order_by('-created_at')[:6].values_list('id', flat=True)
             
             # Get new trades based on plan limits
-            new_trades_query = Trade.objects.filter(
+            new_trades_limit = 9 if plan_name == 'PREMIUM' else 6
+            new_trades = Trade.objects.filter(
                 created_at__gte=subscription_start,
-                plan_type__in=plan_levels,
+                plan_type__in=allowed_plans,
                 status__in=['ACTIVE', 'COMPLETED']
-            ).order_by('created_at')
+            ).order_by('created_at')[:new_trades_limit].values_list('id', flat=True)
             
-            # Apply plan-specific limits
-            if plan_name == 'BASIC':
-                new_trades = new_trades_query[:6]
-            elif plan_name == 'PREMIUM':
-                new_trades = new_trades_query[:9]
-            else:  # SUPER_PREMIUM or FREE_TRIAL
-                new_trades = new_trades_query.all()
+            # Also include free call trades
+            free_trades = Trade.objects.filter(
+                is_free_call=True,
+                status__in=['ACTIVE', 'COMPLETED']
+            ).values_list('id', flat=True)
             
-            new_trade_ids = list(new_trades.values_list('id', flat=True))
+            # Combine free trades with new trades
+            new_trade_ids = list(new_trades) + list(free_trades)
             
             return {
                 'previous_trades': list(previous_trades),

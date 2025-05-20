@@ -105,25 +105,41 @@ class TradeSignalHandler:
                 ).values_list('id', flat=True)
                 return set(all_trades)
             
-            # Standard logic for other plan types
-            # Get trades created after subscription start
+            # Get allowed plan types based on subscription
+            plan_filters = {
+                'BASIC': ['BASIC'],
+                'PREMIUM': ['BASIC', 'PREMIUM'],
+            }
+            allowed_plans = plan_filters.get(subscription.plan.name, [])
+            
+            # Get trades created after subscription start (new trades)
+            new_trades_limit = 9 if subscription.plan.name == 'PREMIUM' else 6
             new_trades = TRADE_MODEL.objects.filter(
                 status__in=['ACTIVE', 'COMPLETED'],
                 created_at__gte=subscription.start_date,
-                plan_type__in=PlanConfig.get_accessible_plans(subscription.plan.name)
-            )
-
-            # Get previously active trades from before subscription
+                plan_type__in=allowed_plans
+            ).order_by('created_at')[:new_trades_limit].values_list('id', flat=True)
+            
+            # Get previously active trades from before subscription (up to 6)
             previous_trades = TRADE_MODEL.objects.filter(
                 status__in=['ACTIVE', 'COMPLETED'],
                 created_at__lt=subscription.start_date,
-                updated_at__gte=subscription.start_date
-            )
-
-            # Combine both querysets
-            accessible_trades = new_trades.union(previous_trades)
-            return set(accessible_trades.values_list('id', flat=True))
-        except Exception:
+                plan_type__in=allowed_plans
+            ).order_by('-created_at')[:6].values_list('id', flat=True)
+            
+            # Combine both sets of trades
+            accessible_trades = set(new_trades) | set(previous_trades)
+            
+            # Add free trades
+            free_trades = TRADE_MODEL.objects.filter(
+                is_free_call=True,
+                status__in=['ACTIVE', 'COMPLETED']
+            ).values_list('id', flat=True)
+            
+            return accessible_trades | set(free_trades)
+            
+        except Exception as e:
+            logger.error(f"Error getting accessible trades: {str(e)}")
             return set()
 
     @staticmethod
