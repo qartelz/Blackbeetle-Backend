@@ -209,6 +209,8 @@ class TradeSignalHandler:
                     # Send WebSocket update
                     group_name = f"trade_updates_{user.id}"
                     
+                    # changes made perfectly
+                    
                     # Customize message for this user if needed
                     user_trade_data = trade_data.copy()
                     if trade.status == 'COMPLETED':
