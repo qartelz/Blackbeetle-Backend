@@ -345,8 +345,24 @@ class Trade(models.Model):
             logger.info(f"PREMIUM plan: returning {result.count()} trades")
             return result
         else:  # SUPER_PREMIUM or FREE_TRIAL
-            result = (active_trades | completed_trades | previous_trades).distinct().order_by('-created_at')
-            logger.info(f"SUPER_PREMIUM plan: returning {result.count()} trades")
+            # For SUPER_PREMIUM and FREE_TRIAL, still need to ensure trade validation
+            # Only include trades that are within subscription time frame
+            # or were active when subscription started
+            filtered_result = []
+            
+            # Get all potential trades
+            all_trades = (active_trades | completed_trades | previous_trades).distinct()
+            
+            # Filter to only get truly accessible trades
+            for trade in all_trades:
+                if (trade.is_free_call 
+                    or trade.created_at >= subscription_date 
+                    or (trade.created_at < subscription_date and trade.status in ['ACTIVE', 'COMPLETED'])):
+                    filtered_result.append(trade.id)
+            
+            # Convert filtered IDs back to queryset
+            result = cls.objects.filter(id__in=filtered_result).distinct().order_by('-created_at')
+            logger.info(f"SUPER_PREMIUM/FREE_TRIAL plan: returning {result.count()} trades")
             return result
 
     def is_trade_accessible(self, user, subscription=None):
@@ -375,8 +391,13 @@ class Trade(models.Model):
                 return self.is_free_call
                 
             # SUPER_PREMIUM and FREE_TRIAL get access to all trades
+            # BUT only when the trade matches their subscription timeline
             if subscription.plan.name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
-                return True
+                # Only allow access to trades created during their subscription period
+                # or trades that were active when subscription started
+                return (self.is_free_call 
+                       or self.created_at >= subscription.start_date 
+                       or (self.created_at < subscription.start_date and self.status in ['ACTIVE', 'COMPLETED']))
                 
             # Free calls are accessible to everyone
             if self.is_free_call:

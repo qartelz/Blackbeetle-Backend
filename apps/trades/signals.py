@@ -98,12 +98,14 @@ class TradeSignalHandler:
     def get_user_accessible_trades(user, subscription):
         """Get list of trades accessible to user based on subscription."""
         try:
-            # Special handling for SUPER_PREMIUM and FREE_TRIAL users - get ALL trades
+            # Special handling for SUPER_PREMIUM and FREE_TRIAL users - use Trade model's method
             if subscription.plan.name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
                 all_trades = TRADE_MODEL.objects.filter(
                     status__in=['ACTIVE', 'COMPLETED']
-                ).values_list('id', flat=True)
-                return set(all_trades)
+                )
+                # Filter trades to only include those that are accessible
+                accessible_trades = [t.id for t in all_trades if t.is_trade_accessible(user, subscription)]
+                return set(accessible_trades)
             
             # Get allowed plan types based on subscription
             plan_filters = {
@@ -149,15 +151,9 @@ class TradeSignalHandler:
         their subscription level and whether the trade is in their accessible list.
         """
         try:
-            # Special case: SUPER_PREMIUM and FREE_TRIAL users always get all trade updates
-            if subscription.plan.name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
-                return True
-            
-            # Get list of trades this user has access to
-            accessible_trades = TradeSignalHandler.get_user_accessible_trades(user, subscription)
-            
-            # Only send updates for trades the user has access to
-            return trade.id in accessible_trades
+            # Instead of special casing SUPER_PREMIUM and FREE_TRIAL users,
+            # use the Trade model's is_trade_accessible method for consistency
+            return trade.is_trade_accessible(user, subscription)
         
         except Exception as e:
             logger.error(f"Error checking if user {user.id} should receive trade update: {str(e)}")
@@ -212,6 +208,8 @@ class TradeSignalHandler:
                     
                     # Send WebSocket update
                     group_name = f"trade_updates_{user.id}"
+                    
+                    # changes made perfectly
                     
                     # Customize message for this user if needed
                     user_trade_data = trade_data.copy()

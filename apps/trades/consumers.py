@@ -6,6 +6,7 @@ import json
 from decimal import Decimal
 import logging
 import asyncio
+import traceback
 from urllib.parse import parse_qs
 from django.utils import timezone
 from rest_framework_simplejwt.authentication import JWTAuthentication
@@ -438,6 +439,9 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                     if company.earliest_trade_date >= subscription_start:
                         new_companies_data.append(company_data)
                     else:
+
+                        previous_companies_data.append(company_data)
+
                         # For previous companies, check if it has relevant previous trades
                         # (active at subscription or completed after subscription)
                         has_previous_relevance = False
