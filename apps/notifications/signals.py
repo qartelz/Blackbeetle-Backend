@@ -354,6 +354,11 @@ def handle_trade_updates(sender, instance, created, **kwargs):
     logger.info(f"Trade signal received - ID: {instance.id}, Status: {instance.status}, Created: {created}")
     
     try:
+        # Skip notifications for PENDING trades
+        if instance.status == 'PENDING':
+            logger.info(f"Skipping notification for PENDING trade {instance.id}")
+            return
+            
         if created:
             # New trade notification
             logger.info(f"Creating notification for new trade {instance.id}")

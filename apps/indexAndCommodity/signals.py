@@ -9,6 +9,9 @@ from decimal import Decimal
 from .models import Trade, TradeHistory,Analysis,Insight
 from apps.notifications.models import Notification
 from django.db import DatabaseError
+import logging
+
+logger = logging.getLogger(__name__)
 
 class NotificationManager:
     @staticmethod
@@ -122,6 +125,13 @@ class NotificationManager:
 def handle_trade_updates(sender, instance, created, **kwargs):
     """Handle all trade-related notifications"""
     
+    # Skip notifications for PENDING trades
+    if instance.status == 'PENDING':
+        logger.info(f"Skipping notification for PENDING trade {instance.id}")
+        return
+    
+    notifications = []
+    
     # Skip if no relevant fields changed
     if not any([
         instance.tracker.has_changed('status'),
@@ -130,8 +140,6 @@ def handle_trade_updates(sender, instance, created, **kwargs):
     ]):
         return
         
-    notifications = []
-    
     # Status change notifications
     if instance.tracker.has_changed('status'):
         if instance.status == 'ACTIVE':
