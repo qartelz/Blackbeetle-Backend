@@ -673,7 +673,7 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             
             # Get trade info for eligibility check
             from apps.trades.models import Trade
-            trade_info = await db_sync_to_async(lambda: Trade.objects.filter(id=trade_id).values('plan_type', 'created_at').first())()
+            trade_info = await db_sync_to_async(lambda: Trade.objects.filter(id=trade_id).values('plan_type', 'created_at', 'status').first())()
             
             if not trade_info:
                 logger.warning(f"Trade not found: {trade_id}")
@@ -681,8 +681,9 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 
             trade_plan_type = trade_info['plan_type']
             trade_created_at = trade_info['created_at']
+            trade_status = trade_info['status']
             
-            logger.info(f"Trade details: id={trade_id}, plan_type={trade_plan_type}, created_at={trade_created_at}")
+            logger.info(f"Trade details: id={trade_id}, plan_type={trade_plan_type}, created_at={trade_created_at}, status={trade_status}")
             
             # Check eligibility for this trade update
             is_eligible = False
@@ -713,16 +714,32 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 # Get accessible trades
                 accessible_trades = await self._get_accessible_trades()
                 
-                # For new trades (created after subscription)
-                if trade_created_at >= subscription_start:
-                    is_in_limits = trade_id in accessible_trades['new_trades']
-                    logger.info(f"New trade limit check for {plan_name} user {self.user.id}: {is_in_limits}")
-                    is_eligible = is_eligible and is_in_limits
+                # For completed trades that the user previously had access to, always allow access
+                if trade_status == 'COMPLETED':
+                    # Special check for completed trades
+                    if trade_id in accessible_trades['previous_trades'] or trade_id in accessible_trades['new_trades']:
+                        is_eligible = True
+                        logger.info(f"User {self.user.id} still has access to completed trade {trade_id}")
+                    else:
+                        # For completed trades, check if this was a trade the user previously had access to
+                        was_previously_accessible = await self._was_trade_previously_accessible(trade_id, subscription_start)
+                        if was_previously_accessible:
+                            is_eligible = True
+                            logger.info(f"User {self.user.id} was previously subscribed to trade {trade_id} - allowing access to completion")
+                        else:
+                            is_eligible = False
+                            logger.info(f"User {self.user.id} never had access to trade {trade_id}")
                 else:
-                    # For previous trades
-                    is_in_limits = trade_id in accessible_trades['previous_trades']
-                    logger.info(f"Previous trade limit check for {plan_name} user {self.user.id}: {is_in_limits}")
-                    is_eligible = is_eligible and is_in_limits
+                    # For new trades (created after subscription)
+                    if trade_created_at >= subscription_start:
+                        is_in_limits = trade_id in accessible_trades['new_trades']
+                        logger.info(f"New trade limit check for {plan_name} user {self.user.id}: {is_in_limits}")
+                        is_eligible = is_eligible and is_in_limits
+                    else:
+                        # For previous trades
+                        is_in_limits = trade_id in accessible_trades['previous_trades']
+                        logger.info(f"Previous trade limit check for {plan_name} user {self.user.id}: {is_in_limits}")
+                        is_eligible = is_eligible and is_in_limits
             
             if is_eligible:
                 logger.info(f"User {self.user.id} is eligible for trade update {trade_id}")
@@ -798,6 +815,7 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
     def _get_company_with_trade(self, trade_id):
         """Get company data that contains the specified trade."""
         from apps.trades.models import Trade, Company
+        from django.db.models import Q
         
         try:
             with transaction.atomic():
@@ -823,26 +841,51 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 intraday_trade = None
                 positional_trade = None
                 
+                # Check if this is the trade being updated
+                updated_trade = trade
+                
+                # Ensure we include the updated trade in our results
+                relevant_trades = []
+                
                 # Check if this trade was created after subscription start
                 is_new_trade = trade.created_at >= subscription_start
                 
-                # Find the most recent trades based on trade category
                 if is_new_trade:
-                    # For new trades, only consider trades created after subscription
+                    # For new trades, consider trades created after subscription
                     relevant_trades = [t for t in active_trades if t.created_at >= subscription_start]
+                    logger.info(f"Processing new trade {trade_id} for company {company.trading_symbol}")
                 else:
-                    # For previous trades, only consider trades active at subscription start
-                    relevant_trades = [t for t in active_trades if t.created_at < subscription_start and t.status == 'ACTIVE']
+                    # For previous trades, consider both:
+                    # 1. Trades active at subscription time
+                    # 2. Completed trades that were active at subscription
+                    relevant_trades = [
+                        t for t in active_trades
+                        if (t.created_at < subscription_start and 
+                            (t.status == 'ACTIVE' or 
+                             (t.status == 'COMPLETED' and t.id == trade_id)))
+                    ]
+                    logger.info(f"Processing previous trade {trade_id} (status: {trade.status}) for company {company.trading_symbol}")
+                
+                # ALWAYS include the updated trade in relevant trades if it's not already included
+                if updated_trade and updated_trade not in relevant_trades:
+                    relevant_trades.append(updated_trade)
+                    logger.info(f"Added updated trade {updated_trade.id} to relevant trades list")
                 
                 # Find most recent intraday and positional trades
-                for t in sorted(relevant_trades, key=lambda x: x.created_at, reverse=True):
-                    if t.trade_type == 'INTRADAY' and intraday_trade is None:
+                # If the updated trade is COMPLETED, prioritize it over other trades of the same type
+                for t in sorted(relevant_trades, key=lambda x: (x.id == trade_id, x.created_at), reverse=True):
+                    if t.trade_type == 'INTRADAY' and (intraday_trade is None or t.id == trade_id):
                         intraday_trade = t
-                    elif t.trade_type == 'POSITIONAL' and positional_trade is None:
+                        logger.info(f"Selected intraday trade {t.id} with status {t.status}")
+                    elif t.trade_type == 'POSITIONAL' and (positional_trade is None or t.id == trade_id):
                         positional_trade = t
+                        logger.info(f"Selected positional trade {t.id} with status {t.status}")
                     
-                    # Break if we've found both types
-                    if intraday_trade and positional_trade:
+                    # Break if we've found both types and the updated trade is included
+                    if intraday_trade and positional_trade and (
+                        (trade.trade_type == 'INTRADAY' and intraday_trade.id == trade_id) or
+                        (trade.trade_type == 'POSITIONAL' and positional_trade.id == trade_id)
+                    ):
                         break
                 
                 # Format company data
@@ -855,6 +898,11 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                     'positional_trade': self._format_trade(positional_trade) if positional_trade else None,
                     'created_at': max([t.created_at for t in relevant_trades]).isoformat() if relevant_trades else None
                 }
+                
+                # Log what we're sending
+                logger.info(f"Sending company data for {company.trading_symbol} with " +
+                           f"intraday trade: {intraday_trade.id if intraday_trade else None} " +
+                           f"positional trade: {positional_trade.id if positional_trade else None}")
                 
                 return company_data
                 
@@ -1281,6 +1329,90 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
         except Exception as e:
             logger.error(f"Error clearing user cache: {str(e)}")
             logger.error(traceback.format_exc())
+
+    @db_sync_to_async
+    def _was_trade_previously_accessible(self, trade_id, subscription_start):
+        """Check if a trade was previously accessible to the user before being completed."""
+        try:
+            from apps.trades.models import Trade
+            from django.utils import timezone
+            
+            # Get the trade
+            trade = Trade.objects.select_related('company').get(id=trade_id)
+            
+            # If it's a new trade (after subscription), check if within plan limits
+            if trade.created_at >= subscription_start:
+                # Check if it's in the user's plan level
+                plan_name = self.subscription.plan.name
+                plan_levels = self.trade_manager.get_plan_levels(plan_name)
+                
+                # If trade type is not in the user's accessible plan levels, it was never accessible
+                if trade.plan_type not in plan_levels:
+                    logger.info(f"Trade {trade_id} with plan type {trade.plan_type} not accessible to {plan_name} user")
+                    return False
+                
+                # Check if it's within the user's trade limits
+                # This will depend on how many new companies the user was allowed
+                trade_counts = self._get_trade_counts_sync()
+                limits = self.company_limits.get(plan_name, {'new': None})
+                
+                # Users with no limits always had access
+                if limits['new'] is None:
+                    return True
+                
+                # If user is below their new trade limit, they had access
+                if trade_counts['new'] < limits['new']:
+                    return True
+                
+                # If user was at their limit, we'd need to do a more complex check
+                # to see if this trade was created before other trades that made them hit the limit
+                # This is a simplification - we assume they didn't have access
+                logger.info(f"User {self.user.id} might not have had access to trade {trade_id} due to limits")
+                return False
+                
+            else:
+                # For previous trades (before subscription), we need to check if they were accessible at subscription start
+                was_active_at_subscription = (
+                    trade.created_at < subscription_start and 
+                    (trade.status == 'ACTIVE' or 
+                     (hasattr(trade, 'completed_at') and 
+                      trade.completed_at is not None and 
+                      trade.completed_at > subscription_start))
+                )
+                
+                if was_active_at_subscription:
+                    # Also check plan limits for previous trades
+                    plan_name = self.subscription.plan.name
+                    plan_levels = self.trade_manager.get_plan_levels(plan_name)
+                    
+                    # If trade type is not in the user's accessible plan levels, it was never accessible
+                    if trade.plan_type not in plan_levels:
+                        logger.info(f"Trade {trade_id} with plan type {trade.plan_type} not accessible to {plan_name} user")
+                        return False
+                    
+                    # Check if it's within the user's previous trade limits
+                    trade_counts = self._get_trade_counts_sync()
+                    limits = self.company_limits.get(plan_name, {'previous': None})
+                    
+                    # Users with no limits always had access
+                    if limits['previous'] is None:
+                        return True
+                    
+                    # If user is below their previous trade limit, they had access
+                    if trade_counts['previous'] < limits['previous']:
+                        return True
+                        
+                # Not active at subscription means they never had access
+                logger.info(f"Trade {trade_id} was not active at subscription start")
+                return False
+                
+        except Trade.DoesNotExist:
+            logger.warning(f"Trade {trade_id} not found when checking previous accessibility")
+            return False
+        except Exception as e:
+            logger.error(f"Error checking if trade {trade_id} was previously accessible: {str(e)}")
+            logger.error(traceback.format_exc())
+            return False
 
 
 class IndexUpdateManager:
