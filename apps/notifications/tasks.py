@@ -30,7 +30,7 @@ def process_trade_notifications(trade_id, notification_type, short_message, deta
     start_time = time.time()
     
     try:
-        # Get the trade
+        # Get the trade with related data
         trade = Trade.objects.select_related('company').get(id=trade_id)
         trade_content_type = ContentType.objects.get_for_model(Trade)
         
@@ -39,10 +39,14 @@ def process_trade_notifications(trade_id, notification_type, short_message, deta
             logger.info(f"Skipping notifications for PENDING trade {trade_id}")
             return
         
+        logger.info(f"Processing notifications for trade {trade_id} ({trade.company.trading_symbol}), status: {trade.status}, plan_type: {trade.plan_type}, created_at: {trade.created_at}")
+        
         # Get eligible plan levels
         from apps.notifications.signals import NotificationManager
         eligible_plans = NotificationManager.get_plan_levels(trade.plan_type)
         eligible_plans_with_premium = eligible_plans + ['SUPER_PREMIUM', 'FREE_TRIAL']
+        
+        logger.info(f"Eligible plans for trade {trade_id}: {eligible_plans_with_premium}")
         
         # Get active subscriptions more efficiently using a single query
         active_subscriptions = Subscription.objects.filter(
@@ -59,45 +63,83 @@ def process_trade_notifications(trade_id, notification_type, short_message, deta
         ).values_list('recipient_id', flat=True))
         
         logger.info(f"Found {active_subscriptions.count()} potentially eligible subscriptions for trade {trade_id}")
+        logger.info(f"Found {len(existing_notifications)} existing notifications for trade {trade_id}")
         
         # Update redirectable status for completed trades
         if trade.status == 'COMPLETED':
             logger.info(f"Trade {trade_id} is completed, updating old notification status")
             try:
-                Notification.objects.filter(
+                updated_count = Notification.objects.filter(
                     trade_id=trade_id,
                     trade_status='ACTIVE'
                 ).update(is_redirectable=False)
+                logger.info(f"Updated redirectable status for {updated_count} notifications")
             except DatabaseError as e:
                 logger.error(f"Database error updating redirectable status: {e}")
         
         # Process subscriptions in batches to determine eligible users
         subscription_count = active_subscriptions.count()
         eligible_users = []
+        not_eligible_count = 0
+        
+        # For previous trades, we need to check more carefully
+        is_previous_trade = False
         
         for i in range(0, subscription_count, BATCH_SIZE):
             batch = active_subscriptions[i:i+BATCH_SIZE]
             
             # We'll collect user IDs from this batch who are eligible
             batch_eligible_users = []
+            batch_not_eligible = 0
             
             for subscription in batch:
                 # Skip if user already has a notification for this trade/type
                 if subscription.user_id in existing_notifications:
                     continue
                 
-                # Use direct trade accessibility check
-                if trade.is_trade_accessible(subscription.user, subscription):
-                    batch_eligible_users.append(subscription.user_id)
-                    logger.info(f"User {subscription.user_id} with {subscription.plan.name} plan is eligible for notification about trade {trade_id}")
-                else:
-                    logger.info(f"User {subscription.user_id} with {subscription.plan.name} plan is NOT eligible for notification about trade {trade_id}")
+                # Check if this is a previous trade for this subscription
+                if trade.created_at < subscription.start_date:
+                    is_previous_trade = True
+                
+                # Use direct trade accessibility check - with more detailed logging
+                try:
+                    # First try the most direct method
+                    if trade.is_trade_accessible(subscription.user, subscription):
+                        batch_eligible_users.append(subscription.user_id)
+                        logger.info(f"User {subscription.user_id} with {subscription.plan.name} plan is eligible for notification about trade {trade_id}")
+                    else:
+                        # If not directly accessible, try to check accessible_trades 
+                        # (especially important for previous trades)
+                        accessible_trades = NotificationManager.get_accessible_trades(subscription.user, subscription)
+                        
+                        if (trade.id in accessible_trades['previous_trades'] or 
+                            trade.id in accessible_trades['new_trades']):
+                            batch_eligible_users.append(subscription.user_id)
+                            logger.info(f"User {subscription.user_id} with {subscription.plan.name} plan is eligible for notification via accessible_trades about trade {trade_id}")
+                        else:
+                            batch_not_eligible += 1
+                            logger.info(f"User {subscription.user_id} with {subscription.plan.name} plan is NOT eligible for notification about trade {trade_id}")
+                except Exception as e:
+                    logger.error(f"Error checking eligibility for user {subscription.user_id}: {str(e)}")
+                    # In case of error, we'll try the accessible_trades method as a fallback
+                    try:
+                        accessible_trades = NotificationManager.get_accessible_trades(subscription.user, subscription)
+                        
+                        if (trade.id in accessible_trades['previous_trades'] or 
+                            trade.id in accessible_trades['new_trades']):
+                            batch_eligible_users.append(subscription.user_id)
+                            logger.info(f"User {subscription.user_id} eligible via fallback method for trade {trade_id}")
+                    except Exception as fallback_error:
+                        logger.error(f"Fallback eligibility check failed for user {subscription.user_id}: {str(fallback_error)}")
             
             eligible_users.extend(batch_eligible_users)
+            not_eligible_count += batch_not_eligible
+            
+            logger.info(f"Batch {i//BATCH_SIZE + 1}: Found {len(batch_eligible_users)} eligible users and {batch_not_eligible} non-eligible users")
         
         # Early return if no eligible users
         if not eligible_users:
-            logger.info(f"No eligible users found for trade {trade_id} notifications")
+            logger.warning(f"No eligible users found for trade {trade_id} notifications (checked {subscription_count} users, {not_eligible_count} were not eligible)")
             return []
         
         # Create notifications in batches
@@ -166,6 +208,8 @@ def send_websocket_notifications(notification_ids, batch_size=20):
             id__in=batch_ids
         ).select_related('recipient')
         
+        logger.info(f"Processing batch of {len(notifications)} notifications")
+        
         for notification in notifications:
             try:
                 # Get the trade object with all related data (with optimized queries)
@@ -177,12 +221,16 @@ def send_websocket_notifications(notification_ids, batch_size=20):
                 ).get(id=notification.trade_id)
                 
                 # Get user's subscription efficiently
-                subscription = Subscription.objects.get(
+                subscription = Subscription.objects.filter(
                     user=notification.recipient,
                     is_active=True,
                     start_date__lte=timezone.now(),
                     end_date__gt=timezone.now()
-                )
+                ).select_related('plan').first()
+                
+                if not subscription:
+                    logger.warning(f"No active subscription found for user {notification.recipient.id}, skipping notification {notification.id}")
+                    continue
                 
                 # Get formatted data
                 from apps.notifications.signals import NotificationManager
@@ -236,16 +284,40 @@ def send_websocket_notifications(notification_ids, batch_size=20):
                     }
                 }
                 
-                # Send notification via websocket
-                async_to_sync(channel_layer.group_send)(
-                    f"notification_updates_{notification.recipient.id}",
-                    payload
-                )
+                # Try multiple channel formats to ensure compatibility
+                user_id = notification.recipient.id
                 
-                sent_count += 1
+                # Original channel name
+                channel_name = f"notification_updates_{user_id}"
+                logger.info(f"Sending notification {notification.id} to channel {channel_name}")
                 
+                try:
+                    async_to_sync(channel_layer.group_send)(
+                        channel_name,
+                        payload
+                    )
+                    sent_count += 1
+                except Exception as channel_error:
+                    logger.error(f"Error sending to channel {channel_name}: {str(channel_error)}")
+                    
+                    # Try alternative channel format if the app uses a different format
+                    alt_channel_name = f"user_{user_id}_notifications"
+                    logger.info(f"Trying alternative channel {alt_channel_name}")
+                    
+                    try:
+                        async_to_sync(channel_layer.group_send)(
+                            alt_channel_name,
+                            payload
+                        )
+                        sent_count += 1
+                        logger.info(f"Successfully sent to alternative channel {alt_channel_name}")
+                    except Exception as alt_channel_error:
+                        logger.error(f"Error sending to alternative channel {alt_channel_name}: {str(alt_channel_error)}")
+                
+            except Trade.DoesNotExist:
+                logger.error(f"Trade {notification.trade_id} not found for notification {notification.id}")
             except Exception as e:
-                logger.error(f"Error sending websocket notification {notification.id}: {str(e)}")
+                logger.error(f"Error sending websocket notification {notification.id}: {str(e)}", exc_info=True)
         
         # Small sleep between batches to avoid overwhelming the websocket server
         if i + batch_size < len(notification_ids):
