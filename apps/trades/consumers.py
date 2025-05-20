@@ -439,9 +439,6 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                     if company.earliest_trade_date >= subscription_start:
                         new_companies_data.append(company_data)
                     else:
-
-                        previous_companies_data.append(company_data)
-
                         # For previous companies, check if it has relevant previous trades
                         # (active at subscription or completed after subscription)
                         has_previous_relevance = False
@@ -485,8 +482,25 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 # Get accurate trade counts from DB for consistency
                 trade_counts = self._get_trade_counts_sync()
                 
+                # Deduplicate companies by ID before sending
+                all_companies = new_companies_data + previous_companies_data
+                unique_companies = {}
+                for company in all_companies:
+                    unique_companies[company['id']] = company
+                
+                deduplicated_stock_data = list(unique_companies.values())
+                
+                # Sort the deduplicated list by created_at date (newest first)
+                deduplicated_stock_data = sorted(
+                    deduplicated_stock_data,
+                    key=lambda x: x['created_at'] if x['created_at'] else '',
+                    reverse=True
+                )
+                
+                logger.info(f"Deduplicated stock data for user {self.user.id}: {len(all_companies)} -> {len(deduplicated_stock_data)} companies")
+                
                 result = {
-                    'stock_data': new_companies_data + previous_companies_data,
+                    'stock_data': deduplicated_stock_data,
                     'index_data': [],
                     'subscription': {
                         'plan': plan_name,
@@ -592,6 +606,22 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             
             # Always get fresh data for initial load
             data = await self._get_filtered_company_data(bypass_cache=True) 
+            
+            # Log data stats for debugging
+            stock_data_count = len(data['stock_data'])
+            company_ids = [company['id'] for company in data['stock_data']]
+            unique_ids = set(company_ids)
+            
+            if len(unique_ids) != stock_data_count:
+                logger.warning(f"Potential duplicate companies in stock_data: {stock_data_count} items but {len(unique_ids)} unique IDs")
+                # Double-check deduplication
+                unique_companies = {}
+                for company in data['stock_data']:
+                    unique_companies[company['id']] = company
+                data['stock_data'] = list(unique_companies.values())
+                logger.info(f"Re-deduplicated stock data: {stock_data_count} -> {len(data['stock_data'])} companies")
+            else:
+                logger.info(f"Stock data looks good: {stock_data_count} companies with {len(unique_ids)} unique IDs")
             
             await self.send(text_data=json.dumps({
                 'type': 'initial_data',
@@ -1228,17 +1258,26 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             user_id = getattr(self.user, 'id', 'unknown')
             subscription_id = getattr(self.subscription, 'id', 'unknown')
             
-            # Keys that need to be cleared
-            keys_to_clear = [
-                f"trade_counts_{user_id}_{subscription_id}",
-                f"company_data_{user_id}_{subscription_id}",
+            # Clear the main cache key directly
+            main_cache_key = f"company_data_{user_id}_{subscription_id}"
+            counts_cache_key = f"trade_counts_{user_id}_{subscription_id}"
+            
+            await sync_to_async(cache.delete)(main_cache_key)
+            await sync_to_async(cache.delete)(counts_cache_key)
+            
+            # Also clear any cache keys that might contain deduplication info for this user
+            pattern_keys = [
                 f"last_company_update_{user_id}_*"
             ]
             
-            for key in keys_to_clear:
-                await sync_to_async(cache.delete)(key)
+            # Delete pattern keys (requires cache backend support or manual iteration)
+            # Since Django's cache doesn't support pattern deletion directly, log a message
+            logger.info(f"Cleared cache keys for user {user_id} with subscription {subscription_id}")
+            
+            # Force cache to regenerate on next access
+            if hasattr(self, 'processed_messages'):
+                self.processed_messages.clear()
                 
-            logger.info(f"Cleared cache for user {user_id} with subscription {subscription_id}")
         except Exception as e:
             logger.error(f"Error clearing user cache: {str(e)}")
             logger.error(traceback.format_exc())
