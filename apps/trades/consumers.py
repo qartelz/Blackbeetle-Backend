@@ -6,6 +6,7 @@ import json
 from decimal import Decimal
 import logging
 import asyncio
+import traceback
 from urllib.parse import parse_qs
 from django.utils import timezone
 from rest_framework_simplejwt.authentication import JWTAuthentication
@@ -14,6 +15,7 @@ from django.db import transaction
 from apps.subscriptions.models import Subscription
 from apps.trades.models import Trade
 from django.db import models
+from django.db.models import Q
 
 logger = logging.getLogger(__name__)
 
@@ -433,11 +435,30 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                         'created_at': company.latest_trade_date.isoformat() if company.latest_trade_date else None
                     }
 
-                    # Categorize based on trade dates
+                    # Check if this is a new company (all trades after subscription)
                     if company.earliest_trade_date >= subscription_start:
                         new_companies_data.append(company_data)
                     else:
+
                         previous_companies_data.append(company_data)
+
+                        # For previous companies, check if it has relevant previous trades
+                        # (active at subscription or completed after subscription)
+                        has_previous_relevance = False
+                        for trade in company.filtered_trades:
+                            if (trade.created_at < subscription_start and 
+                                (trade.status == 'ACTIVE' or 
+                                 (hasattr(trade, 'completed_at') and 
+                                  trade.completed_at and 
+                                  trade.completed_at >= subscription_start))):
+                                has_previous_relevance = True
+                                break
+                        
+                        if has_previous_relevance:
+                            previous_companies_data.append(company_data)
+                            logger.info(f"Added previous company {company.trading_symbol} for {plan_name} user {self.user.id}")
+                        else:
+                            logger.info(f"Skipped previous company {company.trading_symbol} - no relevant trades")
 
                 # Apply limits based on plan type
                 # Always sort by created_at in descending order (newest first) for better UX
@@ -599,15 +620,19 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             action = data.get("action", "updated")
             timestamp = data.get("timestamp", timezone.now().isoformat())
             
+            logger.info(f"Processing trade update: trade_id={trade_id}, status={trade_status}, user_id={self.user.id}, plan={self.subscription.plan.name}")
+            
             # Create a unique message identifier
             message_id = f"{trade_id}:{trade_status}:{action}:{timestamp[:19]}"  # Truncate timestamp to seconds
             
             # Check if we've already processed this message recently
             if message_id in self.processed_messages:
+                logger.info(f"Skipping duplicate message: {message_id}")
                 return
                 
             # Skip PENDING trades
             if trade_status == 'PENDING':
+                logger.info(f"Skipping PENDING trade: {trade_id}")
                 return
                 
             # Add to processed messages
@@ -616,29 +641,69 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             # Schedule cleanup of old message IDs
             asyncio.create_task(self._cleanup_message_id(message_id))
             
+            # Get trade info for eligibility check
+            from apps.trades.models import Trade
+            trade_info = await db_sync_to_async(lambda: Trade.objects.filter(id=trade_id).values('plan_type', 'created_at').first())()
+            
+            if not trade_info:
+                logger.warning(f"Trade not found: {trade_id}")
+                return
+                
+            trade_plan_type = trade_info['plan_type']
+            trade_created_at = trade_info['created_at']
+            
+            logger.info(f"Trade details: id={trade_id}, plan_type={trade_plan_type}, created_at={trade_created_at}")
+            
             # Check eligibility for this trade update
             is_eligible = False
             plan_name = self.subscription.plan.name
+            subscription_start = self.subscription.start_date
             
             # Special handling for SUPER_PREMIUM and FREE_TRIAL
             if plan_name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
+                logger.info(f"User {self.user.id} has {plan_name} - eligible for all trades")
                 is_eligible = True
-            else:
-                # For BASIC and PREMIUM, check accessible trades
+            elif plan_name == 'PREMIUM':
+                # Premium users can access BASIC and PREMIUM trades
+                if trade_plan_type in ['BASIC', 'PREMIUM']:
+                    is_eligible = True
+                    logger.info(f"PREMIUM user {self.user.id} has access to {trade_plan_type} trade {trade_id}")
+                else:
+                    logger.info(f"PREMIUM user {self.user.id} cannot access {trade_plan_type} trade {trade_id}")
+            else:  # BASIC plan
+                # Basic users can only access BASIC trades
+                if trade_plan_type == 'BASIC':
+                    is_eligible = True
+                    logger.info(f"BASIC user {self.user.id} has access to BASIC trade {trade_id}")
+                else:
+                    logger.info(f"BASIC user {self.user.id} cannot access {trade_plan_type} trade {trade_id}")
+            
+            # If user is eligible by plan type, also check if it's within their limit
+            if is_eligible and plan_name not in ['SUPER_PREMIUM', 'FREE_TRIAL']:
+                # Get accessible trades
                 accessible_trades = await self._get_accessible_trades()
-                is_eligible = (
-                    trade_id in accessible_trades['previous_trades'] or 
-                    trade_id in accessible_trades['new_trades']
-                )
-
+                
+                # For new trades (created after subscription)
+                if trade_created_at >= subscription_start:
+                    is_in_limits = trade_id in accessible_trades['new_trades']
+                    logger.info(f"New trade limit check for {plan_name} user {self.user.id}: {is_in_limits}")
+                    is_eligible = is_eligible and is_in_limits
+                else:
+                    # For previous trades
+                    is_in_limits = trade_id in accessible_trades['previous_trades']
+                    logger.info(f"Previous trade limit check for {plan_name} user {self.user.id}: {is_in_limits}")
+                    is_eligible = is_eligible and is_in_limits
+            
             if is_eligible:
+                logger.info(f"User {self.user.id} is eligible for trade update {trade_id}")
                 # Always get fresh data for trade updates, bypassing cache
                 company_data = await self._get_company_with_trade(trade_id)
 
                 if company_data:
-                    # Get fresh subscription info with accurate counts
+                    # Get fresh subscription info
                     subscription_info = await self._get_subscription_info()
                     
+                    logger.info(f"Sending trade update for trade {trade_id} to user {self.user.id}")
                     await self.send(text_data=json.dumps({
                         "type": "trade_update",
                         "data": {
@@ -646,6 +711,10 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                             "subscription": subscription_info
                         }
                     }, cls=DecimalEncoder))
+                else:
+                    logger.warning(f"Could not get company data for trade {trade_id}")
+            else:
+                logger.info(f"User {self.user.id} is NOT eligible for trade update {trade_id}")
 
         except Exception as e:
             logger.error(f"Error processing trade update: {str(e)}")
@@ -1065,15 +1134,18 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             # For other plans, define allowed plan types
             plan_filters = {
                 'BASIC': ['BASIC'],
-                'PREMIUM': ['BASIC', 'PREMIUM'],
+                'PREMIUM': ['BASIC', 'PREMIUM'],  # Premium can access both BASIC and PREMIUM trades
             }
             allowed_plans = plan_filters.get(plan_name, [])
             
-            # Get previous trades (created before subscription)
+            # Get previous trades (created before subscription) that were active at subscription
+            # or completed after subscription start
             previous_trades = Trade.objects.filter(
                 created_at__lt=subscription_start,
                 plan_type__in=allowed_plans,
                 status__in=['ACTIVE', 'COMPLETED']
+            ).filter(
+                Q(status='ACTIVE') | Q(completed_at__gte=subscription_start)
             ).order_by('-created_at')[:6].values_list('id', flat=True)
             
             # Get new trades based on plan limits
@@ -1092,9 +1164,12 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             
             # Combine free trades with new trades
             new_trade_ids = list(new_trades) + list(free_trades)
+            previous_trade_ids = list(previous_trades)
+            
+            logger.info(f"User {self.user.id} with {plan_name} plan - Previous trades: {len(previous_trade_ids)}, New trades: {len(new_trade_ids)}")
             
             return {
-                'previous_trades': list(previous_trades),
+                'previous_trades': previous_trade_ids,
                 'new_trades': new_trade_ids
             }
             

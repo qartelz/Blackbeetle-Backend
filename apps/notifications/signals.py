@@ -11,7 +11,6 @@ from apps.subscriptions.models import Subscription
 from .models import Notification
 from django.db import DatabaseError
 import logging
-
 logger = logging.getLogger(__name__)
 
 class NotificationManager:
@@ -191,6 +190,18 @@ class NotificationManager:
             if trade.is_trade_accessible(subscription.user, subscription):
                 eligible_users.append(subscription.user.id)
                 continue
+
+            # ALL plans should use the same logic for consistency
+            # Get accessible trades for this user based on their subscription plan
+            accessible_trades = NotificationManager.get_accessible_trades(subscription.user, subscription)
+            
+            # Only add user if this trade is in their accessible list
+            if (trade.id in accessible_trades['previous_trades'] or 
+                trade.id in accessible_trades['new_trades']):
+                eligible_users.append(subscription.user.id)
+                logger.info(f"User {subscription.user.id} with {subscription.plan.name} plan is eligible for notification about trade {trade.id}")
+            else:
+                logger.info(f"User {subscription.user.id} with {subscription.plan.name} plan is NOT eligible for notification about trade {trade.id}")
         
         return eligible_users
 
@@ -350,6 +361,11 @@ def handle_trade_updates(sender, instance, created, **kwargs):
     logger.info(f"Trade signal received - ID: {instance.id}, Status: {instance.status}, Created: {created}")
     
     try:
+        # Skip notifications for PENDING trades
+        if instance.status == 'PENDING':
+            logger.info(f"Skipping notification for PENDING trade {instance.id}")
+            return
+            
         if created:
             # New trade notification
             logger.info(f"Creating notification for new trade {instance.id}")
