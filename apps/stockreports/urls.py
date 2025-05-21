@@ -1,12 +1,23 @@
 from django.urls import path
-from . import views
+from .views import (
+    CreateStockReportView,
+    ListStockReportsView,
+    StockReportDetailView,
+    UpdateStockReportView,
+    DeleteStockReportView,
+    DownloadPDFView
+)
 
-app_name = "stockreports"
+app_name = 'stockreports'
 
 urlpatterns = [
-    # path('', views.StockReportListView.as_view(), name='list'),
-    # path('create/', views.StockReportCreateView.as_view(), name='create'),
-    # path('<int:pk>/', views.StockReportDetailView.as_view(), name='detail'),
-    # path('<int:pk>/update/', views.StockReportUpdateView.as_view(), name='update'),
-    # path('<int:pk>/delete/', views.StockReportDeleteView.as_view(), name='delete'),
+    # Basic CRUD operations
+    path('create/', CreateStockReportView.as_view(), name='create-report'),
+    path('list/', ListStockReportsView.as_view(), name='list-reports'),
+    path('detail/<int:pk>/', StockReportDetailView.as_view(), name='report-detail'),
+    path('update/<int:pk>/', UpdateStockReportView.as_view(), name='update-report'),
+    path('delete/<int:pk>/', DeleteStockReportView.as_view(), name='delete-report'),
+    
+    # PDF download
+    path('download/<int:pk>/', DownloadPDFView.as_view(), name='download-pdf'),
 ]

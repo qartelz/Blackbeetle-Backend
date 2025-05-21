@@ -2,7 +2,10 @@ from rest_framework import serializers
 from ..models import Trade, Analysis, IndexAndCommodity
 from django.core.exceptions import ValidationError
 from django.contrib.auth import get_user_model
+from rest_framework.exceptions import ValidationError as DRFValidationError
+
 User = get_user_model()
+
 class AnalysisSerializer(serializers.ModelSerializer):
     class Meta:
         model = Analysis
@@ -68,17 +71,24 @@ class TradeSerializer(serializers.ModelSerializer):
     #     return obj.get_available_trade_types()
 
     def create(self, validated_data):
-        print(validated_data, "validated_data")
-        # user = self.context['request'].user
-        analysis_data = validated_data.pop('index_and_commodity_analysis', None)
-        
-        trade = Trade.objects.create(user=User.objects.get(id="175c8b1c-2652-46b2-8275-8f80e071ca64"), **validated_data)
-        
-        # Create analysis with any combination of fields (or none)
-        if analysis_data:
-            Analysis.objects.create(trade=trade, **analysis_data)
+        try:
+            # Get the user from the request context
+            user = self.context['request'].user
+            if not user or not user.is_authenticated:
+                raise DRFValidationError("Authentication required to create a trade.")
+
+            analysis_data = validated_data.pop('index_and_commodity_analysis', None)
             
-        return trade
+            # Create trade with authenticated user
+            trade = Trade.objects.create(user=user, **validated_data)
+            
+            # Create analysis if provided
+            if analysis_data:
+                Analysis.objects.create(trade=trade, **analysis_data)
+                
+            return trade
+        except Exception as e:
+            raise DRFValidationError(f"Failed to create trade: {str(e)}")
 
     def update(self, instance, validated_data):
         analysis_data = validated_data.pop('index_and_commodity_analysis', None)
