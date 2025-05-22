@@ -19,6 +19,7 @@ class IndexAndCommodityViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         queryset = super().get_queryset()
+<<<<<<< Updated upstream
         search_query = self.request.query_params.get('search', None)
         
         if search_query:
@@ -28,10 +29,13 @@ class IndexAndCommodityViewSet(viewsets.ModelViewSet):
                 Q(instrumentName__icontains=search_query)
             )
         
+=======
+>>>>>>> Stashed changes
         return queryset
 
     def create(self, request, *args, **kwargs):
         try:
+<<<<<<< Updated upstream
             # Log request data for debugging
             print("Request data:", request.data)
             
@@ -80,6 +84,34 @@ class IndexAndCommodityViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
+=======
+            # Remove editable=False fields from validation
+            mutable_data = request.data.copy()
+            serializer = self.get_serializer(data=mutable_data)
+            serializer.is_valid(raise_exception=True)
+            self.perform_create(serializer)
+            headers = self.get_success_headers(serializer.data)
+            return Response(
+                serializer.data, 
+                status=status.HTTP_201_CREATED, 
+                headers=headers
+            )
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+    def perform_create(self, serializer):
+        # Allow saving despite editable=False fields
+        instance = IndexAndCommodity(
+            tradingSymbol=serializer.validated_data['tradingSymbol'],
+            exchange=serializer.validated_data['exchange'],
+            instrumentName=serializer.validated_data['instrumentName']
+        )
+        instance.save(force_insert=True)
+
+>>>>>>> Stashed changes
     @action(detail=False, methods=['GET'], url_path='active')
     def active_indices(self, request):
         try:

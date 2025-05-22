@@ -109,7 +109,11 @@ class TradeSignalHandler:
             # Get allowed plan types based on subscription
             plan_filters = {
                 'BASIC': ['BASIC'],
+<<<<<<< Updated upstream
                 'PREMIUM': ['BASIC', 'PREMIUM'],  # Premium users can access both Basic and Premium trades
+=======
+                'PREMIUM': ['BASIC', 'PREMIUM'],  # Make sure PREMIUM users can access both BASIC and PREMIUM trades
+>>>>>>> Stashed changes
             }
             allowed_plans = plan_filters.get(subscription.plan.name, [])
             
@@ -141,27 +145,30 @@ class TradeSignalHandler:
             
         except Exception as e:
             logger.error(f"Error getting accessible trades: {str(e)}")
+            logger.error(traceback.format_exc())
             return set()
 
     @staticmethod
     def should_send_trade_update(user, trade, subscription):
-        """
-        Determine if a user should receive an update for a specific trade based on
-        their subscription level and whether the trade is in their accessible list.
-        """
+        """Determine if a user should receive updates for a trade."""
         try:
-            # Special case: SUPER_PREMIUM and FREE_TRIAL users always get all trade updates
+            # Free trades are accessible to everyone
+            if trade.is_free_call:
+                return True
+                
+            # No subscription - only free trades
+            if not subscription or not subscription.is_active:
+                return False
+                
+            # SUPER_PREMIUM and FREE_TRIAL get all trades
             if subscription.plan.name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
                 return True
+                
+            # For other plans, check trade accessibility
+            return trade.is_trade_accessible(user, subscription)
             
-            # Get list of trades this user has access to
-            accessible_trades = TradeSignalHandler.get_user_accessible_trades(user, subscription)
-            
-            # Only send updates for trades the user has access to
-            return trade.id in accessible_trades
-        
         except Exception as e:
-            logger.error(f"Error checking if user {user.id} should receive trade update: {str(e)}")
+            logger.error(f"Error checking trade update eligibility: {str(e)}")
             return False
 
     @staticmethod
@@ -181,16 +188,13 @@ class TradeSignalHandler:
             # Get channel layer for WebSocket communication
             channel_layer = get_channel_layer()
             
-            # Prepare trade data once
-            trade_data = TradeUpdateManager.prepare_trade_data(trade, action)
+            # Create notifications for each eligible user
+            notification_count = 0
             
-            # Process notification for each eligible user
-            created_notifications = set()
-
-            # Process users based on access rules
             for subscription in subscriptions:
                 user = subscription.user
                 
+<<<<<<< Updated upstream
                 # Check if user should receive this update
                 if TradeSignalHandler.should_send_trade_update(user, trade, subscription):
                     # Create unique key for this notification
@@ -230,6 +234,44 @@ class TradeSignalHandler:
         except Exception as e:
             logger.error(f"Error processing trade update: {str(e)}")
             logger.error(traceback.format_exc())
+=======
+                # Check if user should receive this trade update
+                if not TradeSignalHandler.should_send_trade_update(user, trade, subscription):
+                    continue
+                    
+                # Create notification
+                notification = Notification.objects.create(
+                    user=user,
+                    type='TRADE',
+                    message_type='trade_update',
+                    short_message=f"Trade updated: {trade.company.tradingSymbol}",
+                    detailed_message=f"The trade for {trade.company.tradingSymbol} has been updated",
+                    related_url=f"/trades/{trade.id}",
+                    trade_status=trade.status,
+                    trade_id=trade.id,
+                    is_redirectable=True,
+                    data={
+                        'updated_company': trade.company.to_dict(),
+                        'subscription': subscription.to_dict()
+                    }
+                )
+                notification_count += 1
+                
+                # Send WebSocket notification
+                async_to_sync(channel_layer.group_send)(
+                    f"notification_updates_{user.id}",
+                    {
+                        'type': 'notification',
+                        'data': notification.to_dict()
+                    }
+                )
+                
+            logger.info(f"Created {notification_count} notifications for trade {trade.id}")
+            
+        except Exception as e:
+            logger.error(f"Error processing trade update: {str(e)}")
+            raise
+>>>>>>> Stashed changes
 
 
 @receiver(post_save, sender=Trade)

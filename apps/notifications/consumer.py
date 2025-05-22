@@ -66,7 +66,126 @@ class UnifiedTradeNotificationManager:
                 status__in=['ACTIVE', 'COMPLETED']
             ).order_by('-created_at')[:6]
             
+<<<<<<< Updated upstream
             return trade in previous_trades
+=======
+            # Simply retrieve existing notifications for the user
+            notifications_query = Notification.objects.filter(
+                recipient=self.user,
+                is_read=False
+            )
+            
+            # For premium users, get up to 100 notifications
+            if is_premium:
+                notifications = notifications_query.order_by('-created_at')[:100]
+            else:
+                # For regular users, limit to 50
+                notifications = notifications_query.order_by('-created_at')[:50]
+            
+            # Get all trade IDs from the notifications
+            trade_ids = [n.trade_id for n in notifications if n.trade_id]
+            
+            # Fetch all trades and companies in a single query to avoid N+1 problem
+            trades_info = {}
+            if trade_ids:
+                trades = Trade.objects.filter(id__in=trade_ids).select_related('company')
+                trades_info = {
+                    t.id: {
+                        'tradingSymbol': t.company.trading_symbol,
+                        'instrumentName': t.company.instrument_type
+                    } for t in trades
+                }
+            
+            # Process notifications with trading info
+            result = []
+            for notif in notifications:
+                notif_data = {
+                    'id': str(notif.id),
+                    'type': notif.notification_type,
+                    'message_type': 'trade_completed' if notif.trade_status == 'COMPLETED' else 'trade_update',
+                    'short_message': notif.short_message,
+                    'detailed_message': notif.detailed_message,
+                    'created_at': notif.created_at.isoformat(),
+                    'related_url': notif.related_url,
+                    'trade_status': notif.trade_status,
+                    'trade_id': notif.trade_id,
+                    'is_redirectable': notif.is_redirectable,
+                    'trade_data': notif.trade_data
+                }
+                
+                # Add trading symbol and instrument name if available
+                if notif.trade_id and notif.trade_id in trades_info:
+                    trade_info = trades_info[notif.trade_id]
+                    notif_data['tradingSymbol'] = trade_info['tradingSymbol']
+                    notif_data['instrumentName'] = trade_info['instrumentName']
+                
+                result.append(notif_data)
+            
+            return result
+        except Exception as e:
+            logger.error(f"Error getting unread notifications: {str(e)}")
+            return []
+
+    async def new_notification(self, event: Dict) -> None:
+        """Handle new notification events"""
+        connection_id = self._connection_id
+        try:
+            if not self.is_connected:
+                return
+                
+            logger.info(f"[{connection_id}] Received notification event for user {self.user.id}")
+            
+            # Get the message data
+            message = event.get('message', {})
+            message_type = message.get('message_type', 'trade_update')
+            trade_id = message.get('trade_id')
+            
+            # Log the notification details
+            logger.info(f"[{connection_id}] Notification type: {message_type}, trade_id: {trade_id}")
+            
+            # For trade updates, verify access
+            if trade_id and message_type in ['trade_update', 'trade_completed']:
+                from apps.trades.models import Trade
+                from apps.subscriptions.models import Subscription
+                
+                # Get user's subscription
+                subscription = await sync_to_async(Subscription.objects.filter(
+                    user=self.user,
+                    is_active=True,
+                    end_date__gt=timezone.now()
+                ).first)()
+                
+                if subscription:
+                    # Get the trade
+                    trade = await sync_to_async(Trade.objects.get)(id=trade_id)
+                    
+                    # Check if user has access
+                    has_access = await sync_to_async(trade.is_trade_accessible)(self.user, subscription)
+                    
+                    if not has_access:
+                        logger.warning(f"[{connection_id}] User {self.user.id} does not have access to trade {trade_id}")
+                        return
+                    
+                    logger.info(f"[{connection_id}] User {self.user.id} has access to trade {trade_id}")
+            
+            # Send the notification to the client
+            await self.send(text_data=json.dumps({
+                'type': 'notification',
+                'data': message
+            }, cls=CustomJSONEncoder))
+            
+            logger.info(f"[{connection_id}] Successfully sent notification to user {self.user.id}")
+            
+        except Exception as e:
+            logger.error(f"[{connection_id}] Error sending notification: {str(e)}", exc_info=True)
+
+    async def _process_message(self, message_type: str, data: Dict) -> None:
+        """Process incoming messages"""
+        if message_type == 'mark_read':
+            notification_id = data.get('notification_id')
+            if notification_id:
+                await self._mark_notification_read(notification_id)
+>>>>>>> Stashed changes
         else:
             # For new trades, respect the plan limits
             new_trades = Trade.objects.filter(

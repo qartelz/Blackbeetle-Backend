@@ -15,7 +15,12 @@ from django.db import transaction
 from apps.subscriptions.models import Subscription
 from apps.trades.models import Trade
 from django.db import models
+<<<<<<< Updated upstream
 from django.db.models import Q
+=======
+import uuid
+import traceback
+>>>>>>> Stashed changes
 
 logger = logging.getLogger(__name__)
 
@@ -79,10 +84,10 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
     }
 
     SUCCESS_MESSAGES = {
-        "connected": "Successfully connected to trade updates.",
-        "initial_data": "Initial trade data loaded successfully.",
-        "trade_update": "Trade update received successfully.",
-        "refresh_complete": "Data refresh completed successfully."
+        "connected": "Successfully connected.",
+        "initial_data": "Initial data loaded successfully.",
+        "trade_update": "Trade update received.",
+        "notification": "Notification received."
     }
 
     def __init__(self, *args, **kwargs):
@@ -122,6 +127,8 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
         }
         self.cache = cache
         self.cache_timeout = 300  # 5 minutes
+        self.connection_id = str(uuid.uuid4())[:8]
+        self._message_cleanup_tasks = {}
 
     async def connect(self):
         """Handle WebSocket connection establishment."""
@@ -641,6 +648,7 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
     async def trade_update(self, event):
         """Handle trade update messages with deduplication."""
         if not self.is_connected or not self.subscription:
+            logger.warning(f"Skipping update - connected: {self.is_connected}, subscription: {bool(self.subscription)}")
             return
 
         try:
@@ -660,17 +668,21 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
                 logger.info(f"Skipping duplicate message: {message_id}")
                 return
                 
+<<<<<<< Updated upstream
             # Skip PENDING trades
             if trade_status == 'PENDING':
                 logger.info(f"Skipping PENDING trade: {trade_id}")
+=======
+            # Check if user has access to this trade
+            if not await self._is_trade_accessible(trade_id):
+>>>>>>> Stashed changes
                 return
                 
-            # Add to processed messages
+            # Add to processed messages and schedule cleanup
             self.processed_messages.add(message_id)
-            
-            # Schedule cleanup of old message IDs
             asyncio.create_task(self._cleanup_message_id(message_id))
             
+<<<<<<< Updated upstream
             # Get trade info for eligibility check
             from apps.trades.models import Trade
             trade_info = await db_sync_to_async(lambda: Trade.objects.filter(id=trade_id).values('plan_type', 'created_at', 'status').first())()
@@ -763,9 +775,26 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             else:
                 logger.info(f"User {self.user.id} is NOT eligible for trade update {trade_id}")
 
+=======
+            # Send the update to the client
+            await self.send(text_data=json.dumps(event, cls=DecimalEncoder))
+            
+>>>>>>> Stashed changes
         except Exception as e:
-            logger.error(f"Error processing trade update: {str(e)}")
+            logger.error(f"Error in trade_update: {str(e)}")
             logger.error(traceback.format_exc())
+
+    async def _is_trade_accessible(self, trade_id):
+        """Check if the user has access to this trade."""
+        try:
+            from .models import Trade
+            trade = await database_sync_to_async(Trade.objects.get)(id=trade_id)
+            has_access = await database_sync_to_async(trade.is_trade_accessible)(self.user, self.subscription)
+            logger.info(f"User {self.user.id} ({self.subscription.plan.name}) access to trade {trade_id}: {has_access}")
+            return has_access
+        except Exception as e:
+            logger.error(f"Error checking trade access: {str(e)}")
+            return False
 
     async def _cleanup_message_id(self, message_id):
         """Remove message ID from processed set after timeout."""
@@ -1000,8 +1029,145 @@ class TradeUpdatesConsumer(AsyncWebsocketConsumer):
             logger.error(traceback.format_exc())
             return False
 
+<<<<<<< Updated upstream
     def _get_trade_counts_sync(self):
         """Synchronous version of _get_trade_counts for use within sync methods."""
+=======
+    @db_sync_to_async
+    def _get_accessible_trades(self):
+        """Get the list of trade IDs that this user has access to."""
+        try:
+            from .models import Trade
+            
+            # Get subscription details
+            subscription_start = self.subscription.start_date
+            plan_name = self.subscription.plan.name
+            
+            logger.info(f"Getting accessible trades for user {self.user.id} with {plan_name} plan")
+            
+            # For SUPER_PREMIUM and FREE_TRIAL - return all trades
+            if plan_name in ['SUPER_PREMIUM', 'FREE_TRIAL']:
+                all_trades = Trade.objects.filter(
+                    status__in=['ACTIVE', 'COMPLETED']
+                ).values_list('id', flat=True)
+                return {
+                    'previous_trades': list(all_trades),
+                    'new_trades': list(all_trades)
+                }
+            
+            # For other plans, define allowed plan types
+            plan_filters = {
+                'BASIC': ['BASIC'],
+                'PREMIUM': ['BASIC', 'PREMIUM'],  # Premium users can access both BASIC and PREMIUM trades
+            }
+            allowed_plans = plan_filters.get(plan_name, [])
+            
+            logger.info(f"Allowed plan types for {plan_name}: {allowed_plans}")
+            
+            # Get new trades based on plan limits
+            new_trades_limit = 9 if plan_name == 'PREMIUM' else 6
+            new_trades = Trade.objects.filter(
+                created_at__gte=subscription_start,
+                plan_type__in=allowed_plans,
+                status__in=['ACTIVE', 'COMPLETED']
+            ).order_by('created_at')[:new_trades_limit].values_list('id', flat=True)
+            
+            # Get previous trades (created before subscription)
+            previous_trades = Trade.objects.filter(
+                created_at__lt=subscription_start,
+                plan_type__in=allowed_plans,
+                status__in=['ACTIVE', 'COMPLETED']
+            ).order_by('-created_at')[:6].values_list('id', flat=True)
+            
+            # Also include free trades
+            free_trades = Trade.objects.filter(
+                is_free_call=True,
+                status__in=['ACTIVE', 'COMPLETED']
+            ).values_list('id', flat=True)
+            
+            # Combine the results
+            result = {
+                'previous_trades': list(previous_trades),
+                'new_trades': list(new_trades) + list(free_trades)
+            }
+            
+            logger.info(f"Found {len(result['previous_trades'])} previous trades and {len(result['new_trades'])} new trades for user {self.user.id}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting accessible trades for user {self.user.id}: {str(e)}")
+            logger.error(traceback.format_exc())
+            return {'previous_trades': [], 'new_trades': []}
+
+    async def _get_cached_or_fetch(self, cache_key, fetch_func, timeout=60):
+        """Get data from cache or fetch it if not available, with a shorter timeout."""
+        try:
+            # Try to get from cache first
+            cached_data = await sync_to_async(cache.get)(cache_key)
+            if cached_data is not None:
+                return cached_data
+            
+            # If not in cache, fetch it
+            data = await fetch_func()
+            
+            # Only cache if we got data
+            if data:
+                # Use a short timeout to ensure data freshness
+                await sync_to_async(cache.set)(cache_key, data, timeout)
+            
+            return data
+        except Exception as e:
+            logger.error(f"Error in cached fetch: {str(e)}")
+            # If cache fails, try to fetch directly
+            return await fetch_func()
+
+    async def _get_subscription_info(self):
+        """Get subscription information."""
+        trade_counts = await self._get_trade_counts()
+        plan_name = self.subscription.plan.name
+        limits = self.company_limits.get(plan_name, {'new': None, 'previous': None, 'total': None})
+        
+        # Calculate remaining trades
+        remaining = {
+            'new': None if limits['new'] is None else max(0, limits['new'] - trade_counts['new']),
+            'previous': None if limits['previous'] is None else max(0, limits['previous'] - trade_counts['previous']),
+            'total': None if limits['total'] is None else max(0, limits['total'] - trade_counts['total'])
+        }
+        
+        return {
+            'plan': plan_name,
+            'start_date': self.subscription.start_date.isoformat(),
+            'end_date': self.subscription.end_date.isoformat(),
+            'limits': limits,
+            'current': trade_counts,
+            'remaining': remaining
+        }
+
+    async def _clear_user_cache(self):
+        """Clear cached data for this user to ensure fresh data on reconnect."""
+        try:
+            user_id = getattr(self.user, 'id', 'unknown')
+            subscription_id = getattr(self.subscription, 'id', 'unknown')
+            
+            # Keys that need to be cleared
+            keys_to_clear = [
+                f"trade_counts_{user_id}_{subscription_id}",
+                f"company_data_{user_id}_{subscription_id}",
+                f"last_company_update_{user_id}_*"
+            ]
+            
+            for key in keys_to_clear:
+                await sync_to_async(cache.delete)(key)
+                
+            logger.info(f"Cleared cache for user {user_id} with subscription {subscription_id}")
+        except Exception as e:
+            logger.error(f"Error clearing user cache: {str(e)}")
+            logger.error(traceback.format_exc())
+
+    def _can_get_new_trade(self, company_id):
+        """Check if user can get a new trade for a company."""
+>>>>>>> Stashed changes
         try:
             from apps.trades.models import Trade
             from django.db import models

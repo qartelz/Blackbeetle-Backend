@@ -1,4 +1,3 @@
-
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -36,7 +35,46 @@ class TradeViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         # return self.queryset.filter(user=self.request.user)
         # return self.queryset
-        return self.queryset.filter(status__in=['PENDING', 'ACTIVE', 'COMPLETED']).exclude(status= 'CANCELLED').order_by('-created_at')
+        return self.queryset.filter(status__in=['PENDING', 'ACTIVE', 'COMPLETED']).exclude(status='CANCELLED').order_by('-created_at')
+
+    def create(self, request, *args, **kwargs):
+        try:
+            serializer = self.get_serializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            
+            # Get the index/commodity instance
+            index_id = request.data.get('index_and_commodity')
+            index = get_object_or_404(IndexAndCommodity, id=index_id)
+            
+            # Create the trade instance
+            trade = Trade(
+                index_and_commodity=index,
+                user=request.user,
+                trade_type=serializer.validated_data['trade_type'],
+                plan_type=serializer.validated_data['plan_type'],
+                warzone=serializer.validated_data.get('warzone', 0.0)
+            )
+            
+            # Run validation
+            trade.full_clean()
+            trade.save()
+            
+            # Return the created trade data
+            return Response(
+                self.get_serializer(trade).data,
+                status=status.HTTP_201_CREATED
+            )
+            
+        except ValidationError as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
     @action(detail=True, methods=['PATCH'], url_path='update-analysis')
     def update_analysis(self, request, pk=None):
