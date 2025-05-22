@@ -142,11 +142,35 @@ class CreateStockReportView(APIView):
     def post(self, request):
         """Create a new stock report"""
         try:
+            # Check if pdf_upload is in request.FILES
+            if 'pdf_upload' in request.FILES:
+                pdf_file = request.FILES['pdf_upload']
+                # Validate content type
+                if not pdf_file.content_type == 'application/pdf':
+                    return Response(
+                        {"error": "Invalid file type. Only PDF files are allowed."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                # Add the file to request.data
+                request.data['pdf_upload'] = pdf_file
+
             serializer = StockReportSerializer(data=request.data)
             if serializer.is_valid():
                 serializer.save()
-                return Response(serializer.data, status=status.HTTP_201_CREATED)
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+                return Response(
+                    {
+                        "message": "Stock report created successfully",
+                        "data": serializer.data
+                    }, 
+                    status=status.HTTP_201_CREATED
+                )
+            return Response(
+                {
+                    "error": "Validation error",
+                    "details": serializer.errors
+                }, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
         except Exception as e:
             return Response(
                 {"error": str(e)},
@@ -208,11 +232,39 @@ class UpdateStockReportView(APIView):
         """Update a specific stock report"""
         try:
             report = get_object_or_404(StockReport, pk=pk)
+            
+            # Handle PDF file update
+            if 'pdf_upload' in request.FILES:
+                pdf_file = request.FILES['pdf_upload']
+                # Validate content type
+                if not pdf_file.content_type == 'application/pdf':
+                    return Response(
+                        {"error": "Invalid file type. Only PDF files are allowed."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                # Delete old PDF if it exists
+                if report.pdf_upload:
+                    if os.path.exists(report.pdf_upload.path):
+                        os.remove(report.pdf_upload.path)
+                # Add the new file to request.data
+                request.data['pdf_upload'] = pdf_file
+
             serializer = StockReportSerializer(report, data=request.data, partial=True)
             if serializer.is_valid():
                 serializer.save()
-                return Response(serializer.data)
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+                return Response(
+                    {
+                        "message": "Stock report updated successfully",
+                        "data": serializer.data
+                    }
+                )
+            return Response(
+                {
+                    "error": "Validation error",
+                    "details": serializer.errors
+                }, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
         except Exception as e:
             return Response(
                 {"error": str(e)},
