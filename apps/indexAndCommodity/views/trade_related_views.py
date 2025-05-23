@@ -1,4 +1,3 @@
-
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -26,17 +25,70 @@ class TradeViewSet(viewsets.ModelViewSet):
     """
     queryset = Trade.objects.select_related('index_and_commodity', 'index_and_commodity_analysis')
     serializer_class = TradeSerializer
-    # permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated]
     pagination_class = CustomTradePagination
     parser_classes = (MultiPartParser, FormParser, JSONParser)
     filter_backends = [DjangoFilterBackend]
-    # filterset_fields = ['status', 'trade_type', 'plan_type']
     filterset_class = TradeFilter
 
     def get_queryset(self):
-        # return self.queryset.filter(user=self.request.user)
-        # return self.queryset
-        return self.queryset.filter(status__in=['PENDING', 'ACTIVE', 'COMPLETED']).exclude(status= 'CANCELLED').order_by('-created_at')
+        return self.queryset.filter(
+            user=self.request.user,
+            status__in=['PENDING', 'ACTIVE', 'COMPLETED']
+        ).exclude(status='CANCELLED').order_by('-created_at')
+
+    def create(self, request, *args, **kwargs):
+        try:
+            serializer = self.get_serializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            
+            # Run model validation
+            instance = serializer.save()
+            try:
+                instance.clean()
+            except ValidationError as e:
+                instance.delete()
+                return Response(
+                    {"error": str(e)},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+                
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+    def update(self, request, *args, **kwargs):
+        try:
+            instance = self.get_object()
+            
+            # Check if user owns the trade
+            if instance.user != request.user:
+                return Response(
+                    {"error": "You don't have permission to modify this trade"},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+                
+            serializer = self.get_serializer(instance, data=request.data, partial=kwargs.pop('partial', False))
+            serializer.is_valid(raise_exception=True)
+            
+            try:
+                updated_instance = serializer.save()
+                updated_instance.clean()
+            except ValidationError as e:
+                return Response(
+                    {"error": str(e)},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+                
+            return Response(serializer.data)
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
     @action(detail=True, methods=['PATCH'], url_path='update-analysis')
     def update_analysis(self, request, pk=None):
